@@ -9,6 +9,7 @@ type AuthToken interface {
 	ExpiresAt() time.Time
 	ProfilePicURL() string
 	IsAdmin() bool
+	UserEmail() string
 }
 
 type Validator interface {

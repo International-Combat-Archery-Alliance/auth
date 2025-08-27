@@ -81,3 +81,21 @@ func (t *GoogleAuthToken) ExpiresAt() time.Time {
 
 	return time.Unix(t.Payload.Expires, 0)
 }
+
+func (t *GoogleAuthToken) UserEmail() string {
+	if t.Payload == nil {
+		return ""
+	}
+
+	email, ok := t.Payload.Claims["email"]
+	if !ok {
+		return ""
+	}
+
+	emailStr, ok := email.(string)
+	if !ok {
+		return ""
+	}
+
+	return emailStr
+}

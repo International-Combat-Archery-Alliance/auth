@@ -5,14 +5,12 @@ import (
 	"time"
 )
 
-type AuthToken[T any] struct {
-	RawToken T
-
-	ExpiresAt     time.Time
-	ProfilePicURL string
-	IsAdmin       bool
+type AuthToken interface {
+	ExpiresAt() time.Time
+	ProfilePicURL() string
+	IsAdmin() bool
 }
 
-type Validator[T any] interface {
-	Validate(ctx context.Context, token string, audience string) (AuthToken[T], error)
+type Validator interface {
+	Validate(ctx context.Context, token string, audience string) (AuthToken, error)
 }

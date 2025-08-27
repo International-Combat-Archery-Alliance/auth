@@ -9,7 +9,7 @@ import (
 	"google.golang.org/api/idtoken"
 )
 
-var _ auth.Validator[*idtoken.Payload] = &Validator{}
+var _ auth.Validator = &Validator{}
 
 type Validator struct {
 	validator *idtoken.Validator
@@ -26,27 +26,27 @@ func NewValidator(ctx context.Context) (*Validator, error) {
 	}, nil
 }
 
-func (v *Validator) Validate(ctx context.Context, token string, audience string) (auth.AuthToken[*idtoken.Payload], error) {
+func (v *Validator) Validate(ctx context.Context, token string, audience string) (auth.AuthToken, error) {
 	payload, err := v.validator.Validate(ctx, token, audience)
 	if err != nil {
-		return auth.AuthToken[*idtoken.Payload]{}, fmt.Errorf("failed to validate token: %w", err)
+		return nil, fmt.Errorf("failed to validate token: %w", err)
 	}
 
-	return auth.AuthToken[*idtoken.Payload]{
-		RawToken: payload,
-
-		ExpiresAt:     expiresAt(payload),
-		IsAdmin:       isAdmin(payload),
-		ProfilePicURL: profilePictureURL(payload),
-	}, nil
+	return &GoogleAuthToken{Payload: payload}, nil
 }
 
-func isAdmin(payload *idtoken.Payload) bool {
-	if payload == nil {
+var _ auth.AuthToken = &GoogleAuthToken{}
+
+type GoogleAuthToken struct {
+	Payload *idtoken.Payload
+}
+
+func (t *GoogleAuthToken) IsAdmin() bool {
+	if t.Payload == nil {
 		return false
 	}
 
-	org, ok := payload.Claims["hd"]
+	org, ok := t.Payload.Claims["hd"]
 	if !ok {
 		return false
 	}
@@ -57,12 +57,12 @@ func isAdmin(payload *idtoken.Payload) bool {
 	return true
 }
 
-func profilePictureURL(payload *idtoken.Payload) string {
-	if payload == nil {
+func (t *GoogleAuthToken) ProfilePicURL() string {
+	if t.Payload == nil {
 		return ""
 	}
 
-	pic, ok := payload.Claims["picture"]
+	pic, ok := t.Payload.Claims["picture"]
 	if !ok {
 		return ""
 	}
@@ -74,10 +74,10 @@ func profilePictureURL(payload *idtoken.Payload) string {
 	return picAsStr
 }
 
-func expiresAt(payload *idtoken.Payload) time.Time {
-	if payload == nil {
+func (t *GoogleAuthToken) ExpiresAt() time.Time {
+	if t.Payload == nil {
 		return time.Time{}
 	}
 
-	return time.Unix(payload.Expires, 0)
+	return time.Unix(t.Payload.Expires, 0)
 }

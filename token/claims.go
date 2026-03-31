@@ -30,7 +30,8 @@ type ICAAClaims struct {
 
 // Validate performs custom validation on the claims
 func (c ICAAClaims) Validate() error {
-	if c.Email == "" {
+	// Email is only required for access tokens
+	if c.TokenType == TokenTypeAccess && c.Email == "" {
 		return fmt.Errorf("email claim is required")
 	}
 	if c.TokenType != TokenTypeAccess && c.TokenType != TokenTypeRefresh {

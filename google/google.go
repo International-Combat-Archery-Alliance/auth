@@ -99,3 +99,8 @@ func (t *GoogleAuthToken) UserEmail() string {
 
 	return emailStr
 }
+
+func (t *GoogleAuthToken) Roles() []auth.Role {
+	// Google tokens don't contain roles
+	return nil
+}

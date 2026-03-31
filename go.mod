@@ -2,7 +2,10 @@ module github.com/International-Combat-Archery-Alliance/auth
 
 go 1.24.6
 
-require google.golang.org/api v0.260.0
+require (
+	github.com/golang-jwt/jwt/v5 v5.3.1
+	google.golang.org/api v0.260.0
+)
 
 require (
 	cloud.google.com/go/auth v0.18.0 // indirect

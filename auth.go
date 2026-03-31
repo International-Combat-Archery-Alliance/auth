@@ -10,6 +10,7 @@ type AuthToken interface {
 	ProfilePicURL() string
 	IsAdmin() bool
 	UserEmail() string
+	Roles() []Role
 }
 
 type Validator interface {

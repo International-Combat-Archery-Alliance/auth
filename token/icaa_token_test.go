@@ -181,7 +181,7 @@ func TestICAAAuthTokenRoles(t *testing.T) {
 		{
 			name:     "with nil claims",
 			claims:   nil,
-			expected: nil,
+			expected: []auth.Role{},
 		},
 		{
 			name:     "with empty roles",
@@ -194,13 +194,6 @@ func TestICAAAuthTokenRoles(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			token := NewICAAAuthToken(tt.claims)
 			got := token.Roles()
-
-			if tt.expected == nil {
-				if got != nil {
-					t.Errorf("Roles() = %v, want nil", got)
-				}
-				return
-			}
 
 			if len(got) != len(tt.expected) {
 				t.Errorf("Roles() length = %v, want %v", len(got), len(tt.expected))

@@ -51,7 +51,10 @@ func (t *ICAAAuthToken) UserEmail() string {
 // Roles returns the user's roles
 func (t *ICAAAuthToken) Roles() []auth.Role {
 	if t.claims == nil {
-		return nil
+		return []auth.Role{}
+	}
+	if t.claims.Roles == nil {
+		return []auth.Role{}
 	}
 	return t.claims.Roles
 }

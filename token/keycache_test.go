@@ -19,33 +19,6 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// fakeSSM is a ParameterGetter backed by an in-memory map. The default
-// parameter value is an empty key document so a fetch succeeds with no keys
-// unless err is set (simulating an unprovisioned/unreachable parameter).
-type fakeSSM struct {
-	mu    sync.Mutex
-	param string
-	err   error
-	calls int32
-}
-
-func newFakeSSM() *fakeSSM {
-	return &fakeSSM{param: `{"keys":[]}`}
-}
-
-func (f *fakeSSM) GetParameter(_ context.Context, name string) (string, error) {
-	atomic.AddInt32(&f.calls, 1)
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.err != nil {
-		return "", f.err
-	}
-	if f.param == "" {
-		return "", errors.New("parameter not found")
-	}
-	return f.param, nil
-}
-
 // jwksServer is a mutable JWKS endpoint for tests.
 type jwksServer struct {
 	mu       sync.Mutex
@@ -129,8 +102,7 @@ func TestKeyCacheStartupFetchNonFatal(t *testing.T) {
 	server := httptest.NewServer(&jwksServer{status: http.StatusInternalServerError})
 	defer server.Close()
 
-	cache := NewKeyCache(server.URL, "/jwtPublicKeys", &fakeSSM{err: errors.New("ssm down")},
-		WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
+	cache := NewKeyCache(server.URL, WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
 
 	err := cache.StartupFetch(context.Background())
 	if err == nil {
@@ -151,8 +123,7 @@ func TestKeyCacheLazyRefetchOnUnknownKid(t *testing.T) {
 	ts := httptest.NewServer(server)
 	defer ts.Close()
 
-	cache := NewKeyCache(ts.URL, "/jwtPublicKeys", newFakeSSM(),
-		WithMinRefetchInterval(150*time.Millisecond))
+	cache := NewKeyCache(ts.URL, WithMinRefetchInterval(150*time.Millisecond))
 
 	// Unknown kid first -> fails and triggers a refetch (negative cache).
 	unknown := signMachine(t, keys["machine-a"], "client-1", "profiles-api", []string{"m2m:player-profiles"}, "machine-b")
@@ -182,8 +153,7 @@ func TestKeyCacheSingleflightOnConcurrentMisses(t *testing.T) {
 	ts := httptest.NewServer(server)
 	defer ts.Close()
 
-	cache := NewKeyCache(ts.URL, "/jwtPublicKeys", newFakeSSM(),
-		WithMinRefetchInterval(150*time.Millisecond))
+	cache := NewKeyCache(ts.URL, WithMinRefetchInterval(150*time.Millisecond))
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
@@ -207,8 +177,7 @@ func TestKeyCacheMinIntervalRespected(t *testing.T) {
 	ts := httptest.NewServer(server)
 	defer ts.Close()
 
-	cache := NewKeyCache(ts.URL, "/jwtPublicKeys", newFakeSSM(),
-		WithMinRefetchInterval(150*time.Millisecond))
+	cache := NewKeyCache(ts.URL, WithMinRefetchInterval(150*time.Millisecond))
 
 	// Prime the cache with a known kid so the first miss is a true miss.
 	known := signMachine(t, keys["machine-a"], "client-1", "profiles-api", []string{"m2m:player-profiles"}, "machine-a")
@@ -243,7 +212,7 @@ func TestKeyCacheNegativeCachePreventsHammering(t *testing.T) {
 	ts := httptest.NewServer(server)
 	defer ts.Close()
 
-	cache := NewKeyCache(ts.URL, "/jwtPublicKeys", &fakeSSM{})
+	cache := NewKeyCache(ts.URL)
 
 	bad := signMachine(t, keys["machine-a"], "client-1", "profiles-api", []string{"m2m:player-profiles"}, "machine-zz")
 	for i := 0; i < 5; i++ {
@@ -262,7 +231,7 @@ func TestKeyCacheLastKnownGoodRetainedOnFailure(t *testing.T) {
 	ts := httptest.NewServer(server)
 	defer ts.Close()
 
-	cache := NewKeyCache(ts.URL, "/jwtPublicKeys", newFakeSSM())
+	cache := NewKeyCache(ts.URL)
 	if err := cache.StartupFetch(context.Background()); err != nil {
 		t.Fatalf("startup fetch: %v", err)
 	}
@@ -280,42 +249,13 @@ func TestKeyCacheLastKnownGoodRetainedOnFailure(t *testing.T) {
 	}
 }
 
-func TestKeyCacheSSMFloorUnion(t *testing.T) {
-	keys := rsaKeys(t, "machine-a")
-
-	// JWKS endpoint is dead; the SSM floor has the key.
-	server := httptest.NewServer(&jwksServer{status: http.StatusInternalServerError})
-	defer server.Close()
-
-	doc := jwksDocument{Keys: []jwkKey{{
-		Kty: "RSA",
-		Kid: "machine-a",
-		N:   base64.RawURLEncoding.EncodeToString(keys["machine-a"].PublicKey.N.Bytes()),
-		E:   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(keys["machine-a"].PublicKey.E)).Bytes()),
-	}}}
-	raw, _ := json.Marshal(doc)
-	ssm := &fakeSSM{param: string(raw)}
-
-	cache := NewKeyCache(server.URL, "/jwtPublicKeys", ssm)
-	if err := cache.StartupFetch(context.Background()); err == nil {
-		t.Fatal("expected partial failure to surface (jwks down) while ssm floor loads")
-	}
-
-	known := signMachine(t, keys["machine-a"], "client-1", "profiles-api", []string{"m2m:player-profiles"}, "machine-a")
-	_, err := cache.ValidateMachineToken(context.Background(), known, "profiles-api", "m2m:player-profiles")
-	if err != nil {
-		t.Fatalf("SSM floor must keep verification working when JWKS is down: %v", err)
-	}
-}
-
 func TestKeyCacheFailClosedWithoutAnyKeys(t *testing.T) {
 	server := httptest.NewServer(newJWKSServer()) // serves an empty key set
 	defer server.Close()
 
-	cache := NewKeyCache(server.URL, "/jwtPublicKeys", &fakeSSM{err: errors.New("no ssm")},
-		WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
-	if err := cache.StartupFetch(context.Background()); err == nil {
-		t.Fatal("expected startup fetch error with no keys anywhere")
+	cache := NewKeyCache(server.URL, WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
+	if err := cache.StartupFetch(context.Background()); err != nil {
+		t.Fatalf("empty key set is not an error; verification fails closed instead: %v", err)
 	}
 
 	keys := rsaKeys(t, "machine-a")
@@ -333,17 +273,16 @@ func TestKeyCacheDevKeysOnlyWhenInstalled(t *testing.T) {
 	keys := rsaKeys(t, "machine-dev")
 	tok := signMachine(t, keys["machine-dev"], "client-1", "profiles-api", []string{"m2m:player-profiles"}, "machine-dev")
 
-	// Without WithDevKeys, a dev-signed token is rejected even if no prod
-	// source is reachable.
-	cache := NewKeyCache("", "/jwtPublicKeys", &fakeSSM{err: errors.New("nope")},
-		WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
+	// Without WithDevKeys, a dev-signed token is rejected (no source
+	// configured at all).
+	cache := NewKeyCache("", WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
 	if _, err := cache.ValidateMachineToken(context.Background(), tok, "profiles-api", "m2m:player-profiles"); err == nil {
 		t.Fatal("dev key must never verify unless explicitly installed")
 	}
 
 	// With WithDevKeys (LOCAL mode), it verifies.
 	devKeys := map[string]*rsa.PublicKey{"machine-dev": &keys["machine-dev"].PublicKey}
-	withDev := NewKeyCache("", "/jwtPublicKeys", &fakeSSM{err: errors.New("nope")},
+	withDev := NewKeyCache("",
 		WithDevKeys(devKeys),
 		WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
 	if _, err := withDev.ValidateMachineToken(context.Background(), tok, "profiles-api", "m2m:player-profiles"); err != nil {

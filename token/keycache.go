@@ -5,7 +5,6 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -14,21 +13,12 @@ import (
 	"time"
 )
 
-// ParameterGetter fetches an SSM parameter value (decrypted). It is a tiny
-// seam so callers can pass their own AWS SDK client; the library stays
-// SDK-agnostic.
-type ParameterGetter interface {
-	GetParameter(ctx context.Context, name string) (string, error)
-}
-
 // DefaultMinRefetchInterval is the minimum time between lazy refetches of the
-// public-key sources. ADR-0006/0007 require >= 30s.
+// public-key source. Production must keep this at or above 30s.
 const DefaultMinRefetchInterval = 30 * time.Second
 
-// jwksDocument mirrors the JWKS JSON shape used both by
-// GET /login/.well-known/jwks.json and the SSM /jwtPublicKeys floor. The two
-// stores share one format so a rotation step can publish to both with the same
-// payload.
+// jwksDocument mirrors the JSON shape served by
+// GET /login/.well-known/jwks.json.
 type jwksDocument struct {
 	Keys []jwkKey `json:"keys"`
 }
@@ -40,12 +30,9 @@ type jwkKey struct {
 	E   string `json:"e"`
 }
 
-// KeyCache holds the RSA public keys used to verify ICAA JWTs. It implements
-// the ADR-0006/0007 key distribution model:
+// KeyCache holds the RSA public keys used to verify ICAA JWTs, fetched from
+// login's JWKS endpoint:
 //
-//   - Keys come from two sources, consulted as a union (JWKS first, then SSM):
-//     the login JWKS endpoint and the /jwtPublicKeys SSM parameter (the
-//     load-bearing availability floor).
 //   - The startup fetch is NON-FATAL: a failure logs and leaves the cache
 //     empty; boot must never abort because login/JWKS is unreachable.
 //   - Verification fails closed: with no key for a kid, validation returns an
@@ -53,16 +40,21 @@ type jwkKey struct {
 //   - Unknown kids trigger a lazy refetch (singleflight, minimum 30s interval,
 //     negative-cached), so key rotation is absorbed without manual action.
 //   - Last-known-good keys are kept per instance: a failed refetch never
-//     clears keys we already hold.
+//     clears keys we already hold, so a running instance keeps verifying even
+//     if login is down.
+//
+// Note: ADR-0006/0007 originally specified an SSM /jwtPublicKeys availability
+// floor consulted in union with the JWKS endpoint. It was deliberately NOT
+// implemented (project decision): no service holds IAM to read it. The
+// residual risk — a key rotation landing while an instance cold-starts during
+// a login outage — is accepted; avoid rotating keys during incidents.
 //
 // LOCAL dev mode is an explicit opt-in: WithDevKeys installs a known dev
 // keypair and nothing else changes. Prod callers must assert !isLocal() before
 // ever passing dev keys.
 type KeyCache struct {
-	jwksURL      string
-	ssmParamName string
-	ssm          ParameterGetter
-	httpClient   *http.Client
+	jwksURL    string
+	httpClient *http.Client
 
 	minRefetchInterval time.Duration
 	logger             *slog.Logger
@@ -72,7 +64,7 @@ type KeyCache struct {
 	// within an instance; a failed fetch never removes entries.
 	keys map[string]*rsa.PublicKey
 	// negative caches kids that were requested but not found, so an unknown
-	// kid cannot be used to hammer the sources faster than the refetch
+	// kid cannot be used to hammer the source faster than the refetch
 	// interval.
 	negative map[string]time.Time
 	// lastRefetch guards the minimum refetch interval.
@@ -119,14 +111,12 @@ func WithDevKeys(keys map[string]*rsa.PublicKey) KeyCacheOption {
 	}
 }
 
-// NewKeyCache creates a KeyCache for the given JWKS endpoint and SSM floor
-// parameter. Either source may be empty, but at least one must be configured
-// for verification to ever succeed.
-func NewKeyCache(jwksURL string, ssmParamName string, ssm ParameterGetter, opts ...KeyCacheOption) *KeyCache {
+// NewKeyCache creates a KeyCache that fetches keys from the given JWKS
+// endpoint. An empty URL is allowed (e.g. LOCAL dev with only dev keys
+// installed), but then verification only succeeds for installed dev keys.
+func NewKeyCache(jwksURL string, opts ...KeyCacheOption) *KeyCache {
 	k := &KeyCache{
 		jwksURL:            jwksURL,
-		ssmParamName:       ssmParamName,
-		ssm:                ssm,
 		httpClient:         &http.Client{Timeout: 5 * time.Second},
 		minRefetchInterval: DefaultMinRefetchInterval,
 		logger:             slog.Default(),
@@ -205,7 +195,7 @@ func (c *KeyCache) Key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 	return nil, fmt.Errorf("%w: %q", ErrUnknownKey, kid)
 }
 
-// fetch pulls keys from JWKS then SSM (union) and merges them into the
+// fetch pulls keys from the JWKS endpoint and merges them into the
 // last-known-good set. It is rate-limited to minRefetchInterval and never
 // clears existing keys on failure.
 func (c *KeyCache) fetch(ctx context.Context) error {
@@ -216,54 +206,21 @@ func (c *KeyCache) fetch(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 
-	var (
-		jwksKeys map[string]*rsa.PublicKey
-		ssmKeys  map[string]*rsa.PublicKey
-		errs     []error
-	)
-
-	if c.jwksURL != "" {
-		keys, err := c.fetchJWKS(ctx)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("jwks fetch: %w", err))
-		}
-		jwksKeys = keys
-	}
-
-	if c.ssm != nil && c.ssmParamName != "" {
-		keys, err := c.fetchSSMFloor(ctx)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("ssm floor fetch: %w", err))
-		}
-		ssmKeys = keys
+	keys, err := c.fetchJWKS(ctx)
+	if err != nil {
+		c.mu.Lock()
+		c.lastRefetch = time.Now()
+		c.mu.Unlock()
+		return fmt.Errorf("jwks fetch: %w", err)
 	}
 
 	c.mu.Lock()
 	c.lastRefetch = time.Now()
-
-	if len(jwksKeys) == 0 && len(ssmKeys) == 0 {
-		c.mu.Unlock()
-		if len(errs) > 0 {
-			return errors.Join(errs...)
-		}
-		return fmt.Errorf("no public keys available from any source")
-	}
-
-	// Union: JWKS first (takes precedence on conflicting kids, though the two
-	// stores should always agree), SSM second as the floor.
-	for kid, key := range jwksKeys {
+	for kid, key := range keys {
 		c.keys[kid] = key
-	}
-	for kid, key := range ssmKeys {
-		if _, exists := c.keys[kid]; !exists {
-			c.keys[kid] = key
-		}
 	}
 	c.mu.Unlock()
 
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
 	return nil
 }
 
@@ -286,20 +243,6 @@ func (c *KeyCache) fetchJWKS(ctx context.Context) (map[string]*rsa.PublicKey, er
 	var doc jwksDocument
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
 		return nil, fmt.Errorf("decode jwks: %w", err)
-	}
-
-	return parseJWKS(doc)
-}
-
-func (c *KeyCache) fetchSSMFloor(ctx context.Context) (map[string]*rsa.PublicKey, error) {
-	raw, err := c.ssm.GetParameter(ctx, c.ssmParamName)
-	if err != nil {
-		return nil, err
-	}
-
-	var doc jwksDocument
-	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
-		return nil, fmt.Errorf("decode %s: %w", c.ssmParamName, err)
 	}
 
 	return parseJWKS(doc)

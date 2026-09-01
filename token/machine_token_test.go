@@ -31,8 +31,7 @@ func setupVerifiedCache(t *testing.T, keys map[string]*rsa.PrivateKey) *KeyCache
 	ts := httptest.NewServer(server)
 	t.Cleanup(ts.Close)
 
-	return NewKeyCache(ts.URL, "/jwtPublicKeys", newFakeSSM(),
-		WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
+	return NewKeyCache(ts.URL, WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
 }
 
 func validToken(t *testing.T, keys map[string]*rsa.PrivateKey, kid string) string {

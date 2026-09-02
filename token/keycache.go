@@ -114,11 +114,13 @@ func NewKeyCache(jwksURL string, opts ...KeyCacheOption) *KeyCache {
 	return k
 }
 
-// StartupFetch loads keys once at boot. It is NON-FATAL by design: it logs and
-// returns the error, but callers must continue starting up regardless. The
-// cache simply starts empty and lazy refetches pick keys up on first use.
+// StartupFetch loads keys once at boot. It is NON-FATAL by design: it logs
+// and returns the error, but callers must continue starting up regardless;
+// the cache simply starts empty and lazy refetches pick keys up on first use.
+// Routing through the singleflight means a boot that races a lazy miss shares
+// its fetch instead of issuing a second one.
 func (c *KeyCache) StartupFetch(ctx context.Context) error {
-	err := c.fetch(ctx)
+	err := c.awaitRefetch(ctx)
 	if err != nil {
 		c.logger.Warn("startup public key fetch failed (non-fatal); verification will fail closed until keys are fetched", slog.String("error", err.Error()))
 	}

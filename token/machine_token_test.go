@@ -255,6 +255,88 @@ func TestValidateMachineTokenKidNamespace(t *testing.T) {
 	})
 }
 
+func TestValidateMachineTokenClaimHardening(t *testing.T) {
+	keys := rsaKeys(t, "machine-01")
+	cache := setupVerifiedCache(t, keys)
+	ctx := context.Background()
+
+	t.Run("future iat rejected", func(t *testing.T) {
+		claims := MachineTokenClaims{
+			TokenType: TokenTypeMachine,
+			Roles:     []string{testScope},
+			RegisteredClaims: jwt.RegisteredClaims{
+				Subject:   testClientID,
+				IssuedAt:  jwt.NewNumericDate(time.Now().Add(time.Hour)),
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
+				Issuer:    DefaultIssuer,
+				Audience:  jwt.ClaimStrings{testAudience},
+			},
+		}
+		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+		tok.Header["kid"] = "machine-01"
+		signed, err := tok.SignedString(keys["machine-01"])
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		if _, err := cache.ValidateMachineToken(ctx, signed, testAudience, testScope); err == nil {
+			t.Fatal("expected token with future iat to be rejected")
+		}
+	})
+
+	t.Run("missing exp rejected", func(t *testing.T) {
+		claims := MachineTokenClaims{
+			TokenType: TokenTypeMachine,
+			Roles:     []string{testScope},
+			RegisteredClaims: jwt.RegisteredClaims{
+				Subject:  testClientID,
+				IssuedAt: jwt.NewNumericDate(time.Now()),
+				Issuer:   DefaultIssuer,
+				Audience: jwt.ClaimStrings{testAudience},
+			},
+		}
+		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+		tok.Header["kid"] = "machine-01"
+		signed, err := tok.SignedString(keys["machine-01"])
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		if _, err := cache.ValidateMachineToken(ctx, signed, testAudience, testScope); err == nil {
+			t.Fatal("expected token without exp to be rejected")
+		}
+	})
+
+	t.Run("missing aud rejected", func(t *testing.T) {
+		claims := MachineTokenClaims{
+			TokenType: TokenTypeMachine,
+			Roles:     []string{testScope},
+			RegisteredClaims: jwt.RegisteredClaims{
+				Subject:   testClientID,
+				IssuedAt:  jwt.NewNumericDate(time.Now()),
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
+				Issuer:    DefaultIssuer,
+			},
+		}
+		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+		tok.Header["kid"] = "machine-01"
+		signed, err := tok.SignedString(keys["machine-01"])
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		if _, err := cache.ValidateMachineToken(ctx, signed, testAudience, testScope); err == nil {
+			t.Fatal("expected token without aud to be rejected")
+		}
+	})
+
+	t.Run("expired beyond leeway rejected", func(t *testing.T) {
+		// exp in the past but within the 10s leeway window is allowed; beyond
+		// it is not.
+		tok := signMachineAt(t, keys["machine-01"], testClientID, testAudience, []string{testScope}, "machine-01", time.Now().Add(-30*time.Second))
+		if _, err := cache.ValidateMachineToken(ctx, tok, testAudience, testScope); err == nil {
+			t.Fatal("expected token expired beyond leeway to be rejected")
+		}
+	})
+}
+
 func TestUserTokenValidationRejectsMachineTokens(t *testing.T) {
 	// ADR-0006 separation: the user-token claims validator must never accept
 	// token_type=machine (user routes reject machine tokens structurally).

@@ -7,10 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -280,12 +282,131 @@ func TestKeyCacheDevKeysOnlyWhenInstalled(t *testing.T) {
 		t.Fatal("dev key must never verify unless explicitly installed")
 	}
 
-	// With WithDevKeys (LOCAL mode), it verifies.
+	// WithDevKeys but WITHOUT WithLocalMode (the prod-forgot-the-guard case):
+	// dev keys must be inert, verification fails closed.
 	devKeys := map[string]*rsa.PublicKey{"machine-dev": &keys["machine-dev"].PublicKey}
-	withDev := NewKeyCache("",
+	noLocal := NewKeyCache("",
 		WithDevKeys(devKeys),
 		WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
-	if _, err := withDev.ValidateMachineToken(context.Background(), tok, "profiles-api", "m2m:player-profiles"); err != nil {
+	if _, err := noLocal.ValidateMachineToken(context.Background(), tok, "profiles-api", "m2m:player-profiles"); err == nil {
+		t.Fatal("dev keys must be inert without WithLocalMode (fail closed in prod)")
+	}
+
+	// Full LOCAL double opt-in (WithLocalMode + WithDevKeys) verifies.
+	withLocal := NewKeyCache("",
+		WithLocalMode(),
+		WithDevKeys(devKeys),
+		WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
+	if _, err := withLocal.ValidateMachineToken(context.Background(), tok, "profiles-api", "m2m:player-profiles"); err != nil {
 		t.Fatalf("dev key should verify when explicitly installed: %v", err)
+	}
+}
+
+func TestKeyCacheNegativeCacheBounded(t *testing.T) {
+	keys := rsaKeys(t, "machine-a")
+	server := newJWKSServer()
+	server.addKey("machine-a", keys["machine-a"])
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+
+	cache := NewKeyCache(ts.URL, WithMinRefetchInterval(100*time.Millisecond))
+
+	// Attacker presents many distinct unknown kids; the negative cache must
+	// stay bounded.
+	for i := 0; i < 3000; i++ {
+		_, _ = cache.Key(context.Background(), fmt.Sprintf("machine-attacker-%d", i))
+	}
+
+	cache.mu.Lock()
+	got := len(cache.negative)
+	cache.mu.Unlock()
+	if got > maxNegativeEntries {
+		t.Fatalf("negative cache exceeds bound: %d > %d", got, maxNegativeEntries)
+	}
+}
+
+func TestKeyCacheOversizeJWKSBodyRejected(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// > 1 MiB of junk; must be treated as a fetch failure, not memory.
+		w.WriteHeader(http.StatusOK)
+		big := strings.Repeat("x", maxJWKSBodySize+100)
+		w.Write([]byte(`{"keys":` + big + `}`))
+	}))
+	defer server.Close()
+
+	cache := NewKeyCache(server.URL, WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
+
+	err := cache.StartupFetch(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected oversize rejection, got %v", err)
+	}
+}
+
+func TestKeyCacheMalformedEntriesSkippedNotFatal(t *testing.T) {
+	// H1 + H2: cryptographically invalid entries (e=1, even e, tiny modulus,
+	// wrong use/alg/kty) are skipped — and a valid key in the same document
+	// still installs.
+	good := rsaKeys(t, "machine-good")
+	weak, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("generate weak key: %v", err)
+	}
+
+	doc := jwksDocument{Keys: []jwkKey{
+		{Kty: "RSA", Kid: "machine-good", Use: "sig", Alg: "RS256",
+			N: base64.RawURLEncoding.EncodeToString(good["machine-good"].PublicKey.N.Bytes()),
+			E: base64.RawURLEncoding.EncodeToString(big.NewInt(int64(good["machine-good"].PublicKey.E)).Bytes())},
+		{Kty: "RSA", Kid: "machine-e1", N: "AQ", E: "AQ"},                                       // e = 1
+		{Kty: "RSA", Kid: "machine-even", N: "AQ", E: "Ag"},                                     // e = 2 (even)
+		{Kty: "RSA", Kid: "machine-weak", N: base64.RawURLEncoding.EncodeToString(weak.PublicKey.N.Bytes()), E: "AQAB"}, // 1024-bit
+		{Kty: "EC", Kid: "machine-ec", N: "AQ", E: "AQAB"},                                      // wrong kty
+		{Kty: "RSA", Kid: "machine-enc", Use: "enc", N: "AQ", E: "AQAB"},                        // wrong use
+		{Kty: "RSA", Kid: "machine-alg", Alg: "HS256", N: "AQ", E: "AQAB"},                      // wrong alg
+		{Kty: "RSA", Kid: "machine-badn", N: "!!!!", E: "AQAB"},                                 // invalid base64
+		{Kty: "RSA", Kid: "", N: "AQ", E: "AQAB"},                                               // missing kid
+	}}
+
+	cache := NewKeyCache("", WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
+	keys := cache.parseJWKS(doc)
+
+	if _, ok := keys["machine-good"]; !ok {
+		t.Fatal("valid key must still be installed despite malformed siblings")
+	}
+	invalid := []string{"machine-e1", "machine-even", "machine-weak", "machine-ec", "machine-enc", "machine-alg", "machine-badn"}
+	for _, kid := range invalid {
+		if _, ok := keys[kid]; ok {
+			t.Fatalf("invalid entry %q must be skipped", kid)
+		}
+	}
+	if len(keys) != 1 {
+		t.Fatalf("expected exactly 1 installed key, got %d", len(keys))
+	}
+}
+
+func TestKeyCacheStartupLazyFetchNoDoubleFetch(t *testing.T) {
+	// L4 regression: StartupFetch racing a lazy Key() miss must not
+	// double-fetch (the interval slot is claimed before the network call).
+	keys := rsaKeys(t, "machine-a")
+	server := newJWKSServer()
+	server.addKey("machine-a", keys["machine-a"])
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+
+	cache := NewKeyCache(ts.URL, WithMinRefetchInterval(150*time.Millisecond))
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = cache.StartupFetch(context.Background())
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = cache.Key(context.Background(), "machine-a")
+	}()
+	wg.Wait()
+
+	if got := server.fetches(); got != 1 {
+		t.Fatalf("expected exactly 1 fetch for concurrent startup + lazy miss, got %d", got)
 	}
 }

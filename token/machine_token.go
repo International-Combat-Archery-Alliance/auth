@@ -127,21 +127,12 @@ func (s *MachineTokenSigner) Sign(clientID string, audience string, scopes []str
 	return signed, nil
 }
 
-// ValidateMachineToken verifies a machine JWT against the key cache and
-// enforces the ADR-0006 rules:
-//
-//   - RS256 only, kid namespaced "machine-*" (alg↔kid binding; no HS256, no
-//     alg=none);
-//   - iss == icaa.world, exp required, 30s leeway;
-//   - token_type == machine (never access);
-//   - the token's aud must contain the callee-specific audience (this function
-//     MUST be called with the callee's own aud — e.g. "profiles-api", NOT
-//     "icaa-api");
-//   - sub (clientId) is present;
-//   - roles contains the EXACT requiredScope string (never a prefix match).
-//
-// Fail closed: if no key exists for the token's kid (e.g. cache empty and the
-// lazy refetch came up empty), an error is returned — never "allow".
+// ValidateMachineToken verifies a machine JWT against the key cache
+// (ADR-0006): RS256 only with machine-* kid binding, iss=icaa.world,
+// exp required, iat validated, 10s leeway, token_type=machine, sub present.
+// Audience is the callee's own (e.g. "profiles-api", never "icaa-api") and
+// requiredScope must match EXACTLY (never prefix). Fail closed: no key for the
+// kid -> error (401), never "allow".
 func (c *KeyCache) ValidateMachineToken(ctx context.Context, tokenString string, audience string, requiredScope string) (*MachineTokenClaims, error) {
 	claims := &MachineTokenClaims{}
 
@@ -150,7 +141,11 @@ func (c *KeyCache) ValidateMachineToken(ctx context.Context, tokenString string,
 		jwt.WithAudience(audience),
 		jwt.WithIssuer(DefaultIssuer),
 		jwt.WithExpirationRequired(),
-		jwt.WithLeeway(30*time.Second),
+		jwt.WithIssuedAt(),
+		// Leeway is 10s, not 30s: machine tokens live only 5 minutes, so a larger
+		// window would honor expired tokens too long (all services run on
+		// AWS-synced clocks).
+		jwt.WithLeeway(10*time.Second),
 	)
 
 	tok, err := parser.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (any, error) {
@@ -172,6 +167,7 @@ func (c *KeyCache) ValidateMachineToken(ctx context.Context, tokenString string,
 	if err := claims.Validate(); err != nil {
 		return nil, err
 	}
+	// jwt/v5 auto-invokes Validate(); explicit call kept as defense-in-depth.
 	if claims.Subject == "" {
 		return nil, fmt.Errorf("machine token missing sub (clientId)")
 	}

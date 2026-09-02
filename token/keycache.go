@@ -6,19 +6,21 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // DefaultMinRefetchInterval is the minimum time between lazy refetches of the
 // public-key source. Production must keep this at or above 30s.
 const DefaultMinRefetchInterval = 30 * time.Second
 
-// jwksDocument mirrors the JSON shape served by
-// GET /login/.well-known/jwks.json.
+// jwksDocument mirrors the JSON served by GET /login/.well-known/jwks.json.
 type jwksDocument struct {
 	Keys []jwkKey `json:"keys"`
 }
@@ -26,32 +28,31 @@ type jwksDocument struct {
 type jwkKey struct {
 	Kty string `json:"kty"`
 	Kid string `json:"kid"`
+	Use string `json:"use,omitempty"`
+	Alg string `json:"alg,omitempty"`
 	N   string `json:"n"`
 	E   string `json:"e"`
 }
 
+// Hardening bounds (PR #4 review): cap the fetched document and require
+// signature-capable RSA keys strong enough to trust for verification.
+const (
+	maxJWKSBodySize    = 1 << 20 // 1 MiB
+	minKeyBits         = 2048    // login signs with 2048-bit keys
+	maxNegativeEntries = 1024    // attacker-controlled kids cannot grow memory
+)
+
 // KeyCache holds the RSA public keys used to verify ICAA JWTs, fetched from
-// login's JWKS endpoint:
+// login's JWKS endpoint. Fetch is non-fatal at startup, verification fails
+// closed, unknown kids trigger a rate-limited lazy refetch (singleflight, 30s
+// min interval, bounded negative cache), and last-known-good keys survive
+// endpoint failures. Only kty=RSA, use=sig, alg=RS256 keys >= 2048 bits are
+// installed; malformed entries are skipped, never fatal.
 //
-//   - The startup fetch is NON-FATAL: a failure logs and leaves the cache
-//     empty; boot must never abort because login/JWKS is unreachable.
-//   - Verification fails closed: with no key for a kid, validation returns an
-//     error (401) — it never falls back to "allow".
-//   - Unknown kids trigger a lazy refetch (singleflight, minimum 30s interval,
-//     negative-cached), so key rotation is absorbed without manual action.
-//   - Last-known-good keys are kept per instance: a failed refetch never
-//     clears keys we already hold, so a running instance keeps verifying even
-//     if login is down.
-//
-// Note: ADR-0006/0007 originally specified an SSM /jwtPublicKeys availability
-// floor consulted in union with the JWKS endpoint. It was deliberately NOT
-// implemented (project decision): no service holds IAM to read it. The
-// residual risk — a key rotation landing while an instance cold-starts during
-// a login outage — is accepted; avoid rotating keys during incidents.
-//
-// LOCAL dev mode is an explicit opt-in: WithDevKeys installs a known dev
-// keypair and nothing else changes. Prod callers must assert !isLocal() before
-// ever passing dev keys.
+// The SSM /jwtPublicKeys floor from ADR-0006/0007 is intentionally NOT
+// implemented (no service holds IAM); don't rotate keys during incidents.
+// Dev keys (WithDevKeys) are only consulted with WithLocalMode also set —
+// nothing infers LOCAL from the environment.
 type KeyCache struct {
 	jwksURL    string
 	httpClient *http.Client
@@ -60,14 +61,14 @@ type KeyCache struct {
 	logger             *slog.Logger
 
 	mu sync.Mutex
-	// keys is the last-known-good set (kid -> public key). It only ever grows
-	// within an instance; a failed fetch never removes entries.
+	// keys is last-known-good (failed fetches never remove entries).
 	keys map[string]*rsa.PublicKey
-	// negative caches kids that were requested but not found, so an unknown
-	// kid cannot be used to hammer the source faster than the refetch
-	// interval.
-	negative map[string]time.Time
-	// lastRefetch guards the minimum refetch interval.
+	// devKeys are inert unless localMode is set (double opt-in).
+	devKeys   map[string]*rsa.PublicKey
+	localMode bool
+	// negative caches unknown kids to bound refetch hammering; entries expire
+	// and are pruned on insert (bounded by maxNegativeEntries).
+	negative    map[string]time.Time
 	lastRefetch time.Time
 	// refetchDone is non-nil while a lazy refetch is in flight (singleflight).
 	refetchDone chan struct{}
@@ -83,30 +84,35 @@ func WithKeyCacheHTTPClient(c *http.Client) KeyCacheOption {
 	}
 }
 
-// WithMinRefetchInterval overrides the minimum time between lazy refetches.
-// Production MUST keep this at or above 30s per ADR-0006/0007; lower values
-// (minimum 100ms) are only useful in tests.
+// WithMinRefetchInterval overrides the lazy-refetch minimum interval.
+// Production MUST stay at or above 30s per ADR-0006/0007; lower values
+// (min 100ms) are only useful in tests.
 func WithMinRefetchInterval(d time.Duration) KeyCacheOption {
 	return func(k *KeyCache) {
 		k.minRefetchInterval = max(d, 100*time.Millisecond)
 	}
 }
 
-// WithKeyCacheLogger sets a logger for refetch warnings.
+// WithKeyCacheLogger sets a logger for fetch warnings.
 func WithKeyCacheLogger(l *slog.Logger) KeyCacheOption {
 	return func(k *KeyCache) {
 		k.logger = l
 	}
 }
 
-// WithDevKeys installs a dev public key set (LOCAL mode). It is explicit:
-// nothing infers LOCAL from the environment, and verification does not consult
-// these keys unless they were installed here. Prod code MUST assert !isLocal()
-// before calling this option.
+// WithLocalMode declares this cache LOCAL. Without it, dev keys are inert.
+// Explicit caller declaration — never inferred from the environment (ADR-0006).
+func WithLocalMode() KeyCacheOption {
+	return func(k *KeyCache) {
+		k.localMode = true
+	}
+}
+
+// WithDevKeys installs a dev public key set. Only effective with WithLocalMode.
 func WithDevKeys(keys map[string]*rsa.PublicKey) KeyCacheOption {
 	return func(k *KeyCache) {
 		for kid, key := range keys {
-			k.keys[kid] = key
+			k.devKeys[kid] = key
 		}
 	}
 }
@@ -121,6 +127,7 @@ func NewKeyCache(jwksURL string, opts ...KeyCacheOption) *KeyCache {
 		minRefetchInterval: DefaultMinRefetchInterval,
 		logger:             slog.Default(),
 		keys:               make(map[string]*rsa.PublicKey),
+		devKeys:            make(map[string]*rsa.PublicKey),
 		negative:           make(map[string]time.Time),
 	}
 
@@ -143,8 +150,8 @@ func (c *KeyCache) StartupFetch(ctx context.Context) error {
 }
 
 // Key returns the public key for kid, triggering a lazy refetch on a miss.
-// It returns ErrUnknownKey (fail closed) if no key can be found. Entries in
-// the negative cache short-circuit repeated lookups of the same unknown kid.
+// Fail closed with ErrUnknownKey if no key can be found (negative cache
+// short-circuits repeat lookups).
 func (c *KeyCache) Key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	c.mu.Lock()
 
@@ -152,14 +159,20 @@ func (c *KeyCache) Key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 		c.mu.Unlock()
 		return key, nil
 	}
+	// Dev keys are LOCAL-only (WithLocalMode must be set).
+	if c.localMode {
+		if key, ok := c.devKeys[kid]; ok {
+			c.mu.Unlock()
+			return key, nil
+		}
+	}
 
 	if until, neg := c.negative[kid]; neg && time.Now().Before(until) {
 		c.mu.Unlock()
 		return nil, fmt.Errorf("%w: %q", ErrUnknownKey, kid)
 	}
 
-	// Singleflight: if a refetch is already in flight, wait for it rather
-	// than issuing another.
+	// Singleflight: wait for an in-flight refetch rather than issuing another.
 	if c.refetchDone == nil {
 		c.refetchDone = make(chan struct{})
 		c.mu.Unlock()
@@ -189,33 +202,47 @@ func (c *KeyCache) Key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 		return key, nil
 	}
 
-	// Still unknown: negative-cache so repeated requests for this kid cannot
-	// hammer the sources.
-	c.negative[kid] = time.Now().Add(c.minRefetchInterval)
+	// Still unknown: negative-cache it, pruning stale/over-limit entries so
+	// attacker-controlled kids cannot grow the cache without bound.
+	now := time.Now()
+	for existingKid, expiresAt := range c.negative {
+		if now.After(expiresAt) {
+			delete(c.negative, existingKid)
+		}
+		if len(c.negative) < maxNegativeEntries {
+			break
+		}
+	}
+	if len(c.negative) >= maxNegativeEntries {
+		for existingKid := range c.negative {
+			delete(c.negative, existingKid)
+			if len(c.negative) < maxNegativeEntries {
+				break
+			}
+		}
+	}
+	c.negative[kid] = now.Add(c.minRefetchInterval)
 	return nil, fmt.Errorf("%w: %q", ErrUnknownKey, kid)
 }
 
-// fetch pulls keys from the JWKS endpoint and merges them into the
-// last-known-good set. It is rate-limited to minRefetchInterval and never
-// clears existing keys on failure.
+// fetch pulls keys from the JWKS endpoint into the last-known-good set.
+// Rate-limited to minRefetchInterval; the slot is claimed BEFORE the network
+// call so a concurrent StartupFetch + first lazy miss cannot double-fetch.
 func (c *KeyCache) fetch(ctx context.Context) error {
 	c.mu.Lock()
 	if time.Since(c.lastRefetch) < c.minRefetchInterval {
 		c.mu.Unlock()
 		return nil
 	}
+	c.lastRefetch = time.Now()
 	c.mu.Unlock()
 
 	keys, err := c.fetchJWKS(ctx)
 	if err != nil {
-		c.mu.Lock()
-		c.lastRefetch = time.Now()
-		c.mu.Unlock()
 		return fmt.Errorf("jwks fetch: %w", err)
 	}
 
 	c.mu.Lock()
-	c.lastRefetch = time.Now()
 	for kid, key := range keys {
 		c.keys[kid] = key
 	}
@@ -240,46 +267,70 @@ func (c *KeyCache) fetchJWKS(ctx context.Context) (map[string]*rsa.PublicKey, er
 		return nil, fmt.Errorf("jwks endpoint returned %s", resp.Status)
 	}
 
+	// Bound the body so a hostile/misbehaving endpoint can't cause unbounded
+	// allocation on every refetch.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJWKSBodySize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read jwks body: %w", err)
+	}
+	if len(body) > maxJWKSBodySize {
+		return nil, fmt.Errorf("jwks response exceeds %d bytes", maxJWKSBodySize)
+	}
+
 	var doc jwksDocument
-	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil, fmt.Errorf("decode jwks: %w", err)
 	}
 
-	return parseJWKS(doc)
+	return c.parseJWKS(doc), nil
 }
 
-// parseJWKS converts a jwksDocument into a kid -> public key map. Only RSA
-// keys are accepted (kty == "RSA"); anything else is skipped so a malformed or
-// foreign key entry can never be installed.
-func parseJWKS(doc jwksDocument) (map[string]*rsa.PublicKey, error) {
+// parseJWKS installs only signature-capable RSA keys (use=sig, alg=RS256,
+// modulus >= 2048 bits, odd exponent > 1). Invalid entries are skipped so one
+// bad key can't poison the document (verification fails closed per-key).
+func (c *KeyCache) parseJWKS(doc jwksDocument) map[string]*rsa.PublicKey {
 	keys := make(map[string]*rsa.PublicKey, len(doc.Keys))
+	skipped := 0
 	for _, k := range doc.Keys {
-		if k.Kty != "RSA" {
-			continue
-		}
-		if k.Kid == "" || k.N == "" || k.E == "" {
+		if k.Kty != "RSA" ||
+			(k.Use != "" && k.Use != "sig") ||
+			(k.Alg != "" && k.Alg != jwt.SigningMethodRS256.Alg()) ||
+			k.Kid == "" || k.N == "" || k.E == "" {
+			skipped++
 			continue
 		}
 		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
 		if err != nil {
-			return nil, fmt.Errorf("invalid base64url modulus for kid %q: %w", k.Kid, err)
+			skipped++
+			continue
 		}
 		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
 		if err != nil {
-			return nil, fmt.Errorf("invalid base64url exponent for kid %q: %w", k.Kid, err)
+			skipped++
+			continue
 		}
-		// The exponent is an unsigned big-endian integer, often just "AQAB".
+		modulus := new(big.Int).SetBytes(nBytes)
+		if modulus.BitLen() < minKeyBits {
+			skipped++
+			continue
+		}
+		// Exponent is an unsigned big-endian integer, usually 65537.
 		var e int
 		for _, b := range eBytes {
 			e = e<<8 | int(b)
 		}
-		if e == 0 {
+		// e=1 or even exponents make verification trivially forgeable.
+		if e < 3 || e%2 == 0 {
+			skipped++
 			continue
 		}
 		keys[k.Kid] = &rsa.PublicKey{
-			N: new(big.Int).SetBytes(nBytes),
+			N: modulus,
 			E: e,
 		}
 	}
-	return keys, nil
+	if skipped > 0 {
+		c.logger.Warn("skipped invalid jwks entries", slog.Int("count", skipped))
+	}
+	return keys
 }

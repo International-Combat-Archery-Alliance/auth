@@ -17,7 +17,7 @@ import (
 )
 
 // DefaultMinRefetchInterval is the minimum time between lazy refetches of the
-// public-key source. Production must keep this at or above 30s.
+// public-key source.
 const DefaultMinRefetchInterval = 30 * time.Second
 
 // jwksDocument mirrors the JSON served by GET /login/.well-known/jwks.json.
@@ -34,12 +34,11 @@ type jwkKey struct {
 	E   string `json:"e"`
 }
 
-// Hardening bounds (PR #4 review): cap the fetched document and require
-// signature-capable RSA keys strong enough to trust for verification.
+// Bounds for fetched documents and installed keys.
 const (
 	maxJWKSBodySize    = 1 << 20 // 1 MiB
 	minKeyBits         = 2048    // login signs with 2048-bit keys
-	maxNegativeEntries = 1024    // attacker-controlled kids cannot grow memory
+	maxNegativeEntries = 1024    // cap attacker-controlled cache entries
 )
 
 // KeyCache holds the RSA public keys used to verify ICAA JWTs, fetched from
@@ -47,12 +46,8 @@ const (
 // closed, unknown kids trigger a rate-limited lazy refetch (singleflight, 30s
 // min interval, bounded negative cache), and last-known-good keys survive
 // endpoint failures. Only kty=RSA, use=sig, alg=RS256 keys >= 2048 bits are
-// installed; malformed entries are skipped, never fatal.
-//
-// The SSM /jwtPublicKeys floor from ADR-0006/0007 is intentionally NOT
-// implemented (no service holds IAM); don't rotate keys during incidents.
-// Dev keys (WithDevKeys) are only consulted with WithLocalMode also set —
-// nothing infers LOCAL from the environment.
+// installed; malformed entries are skipped, never fatal. Dev keys
+// (WithDevKeys) are only consulted with WithLocalMode also set.
 type KeyCache struct {
 	jwksURL    string
 	httpClient *http.Client
@@ -84,9 +79,8 @@ func WithKeyCacheHTTPClient(c *http.Client) KeyCacheOption {
 	}
 }
 
-// WithMinRefetchInterval overrides the lazy-refetch minimum interval.
-// Production MUST stay at or above 30s per ADR-0006/0007; lower values
-// (min 100ms) are only useful in tests.
+// WithMinRefetchInterval overrides the lazy-refetch minimum interval
+// (default 30s; minimum 100ms).
 func WithMinRefetchInterval(d time.Duration) KeyCacheOption {
 	return func(k *KeyCache) {
 		k.minRefetchInterval = max(d, 100*time.Millisecond)
@@ -101,7 +95,6 @@ func WithKeyCacheLogger(l *slog.Logger) KeyCacheOption {
 }
 
 // WithLocalMode declares this cache LOCAL. Without it, dev keys are inert.
-// Explicit caller declaration — never inferred from the environment (ADR-0006).
 func WithLocalMode() KeyCacheOption {
 	return func(k *KeyCache) {
 		k.localMode = true

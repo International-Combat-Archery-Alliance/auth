@@ -356,14 +356,14 @@ func TestKeyCacheMalformedEntriesSkippedNotFatal(t *testing.T) {
 		{Kty: "RSA", Kid: "machine-good", Use: "sig", Alg: "RS256",
 			N: base64.RawURLEncoding.EncodeToString(good["machine-good"].PublicKey.N.Bytes()),
 			E: base64.RawURLEncoding.EncodeToString(big.NewInt(int64(good["machine-good"].PublicKey.E)).Bytes())},
-		{Kty: "RSA", Kid: "machine-e1", N: "AQ", E: "AQ"},                                       // e = 1
-		{Kty: "RSA", Kid: "machine-even", N: "AQ", E: "Ag"},                                     // e = 2 (even)
+		{Kty: "RSA", Kid: "machine-e1", N: "AQ", E: "AQ"},                                                               // e = 1
+		{Kty: "RSA", Kid: "machine-even", N: "AQ", E: "Ag"},                                                             // e = 2 (even)
 		{Kty: "RSA", Kid: "machine-weak", N: base64.RawURLEncoding.EncodeToString(weak.PublicKey.N.Bytes()), E: "AQAB"}, // 1024-bit
-		{Kty: "EC", Kid: "machine-ec", N: "AQ", E: "AQAB"},                                      // wrong kty
-		{Kty: "RSA", Kid: "machine-enc", Use: "enc", N: "AQ", E: "AQAB"},                        // wrong use
-		{Kty: "RSA", Kid: "machine-alg", Alg: "HS256", N: "AQ", E: "AQAB"},                      // wrong alg
-		{Kty: "RSA", Kid: "machine-badn", N: "!!!!", E: "AQAB"},                                 // invalid base64
-		{Kty: "RSA", Kid: "", N: "AQ", E: "AQAB"},                                               // missing kid
+		{Kty: "EC", Kid: "machine-ec", N: "AQ", E: "AQAB"},                                                              // wrong kty
+		{Kty: "RSA", Kid: "machine-enc", Use: "enc", N: "AQ", E: "AQAB"},                                                // wrong use
+		{Kty: "RSA", Kid: "machine-alg", Alg: "HS256", N: "AQ", E: "AQAB"},                                              // wrong alg
+		{Kty: "RSA", Kid: "machine-badn", N: "!!!!", E: "AQAB"},                                                         // invalid base64
+		{Kty: "RSA", Kid: "", N: "AQ", E: "AQAB"},                                                                       // missing kid
 	}}
 
 	cache := NewKeyCache("", WithKeyCacheLogger(slog.New(slog.DiscardHandler)))

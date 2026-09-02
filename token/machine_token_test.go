@@ -338,8 +338,8 @@ func TestValidateMachineTokenClaimHardening(t *testing.T) {
 }
 
 func TestUserTokenValidationRejectsMachineTokens(t *testing.T) {
-	// ADR-0006 separation: the user-token claims validator must never accept
-	// token_type=machine (user routes reject machine tokens structurally).
+	// The user-token claims validator must never accept token_type=machine
+	// (user routes reject machine tokens structurally).
 	claims := &ICAAClaims{TokenType: TokenTypeMachine}
 	if err := claims.Validate(); err == nil {
 		t.Fatal("expected user claims Validate() to reject token_type=machine")

@@ -15,17 +15,16 @@ import (
 const (
 	// TokenTypeMachine is the token_type claim value for machine (m2m) tokens.
 	TokenTypeMachine TokenType = "machine"
-	// MachineKidPrefix namespaces machine-token keys (ADR-0006). User-token
-	// keys use the "user-" namespace (ADR-0007).
+	// MachineKidPrefix namespaces machine-token keys. User-token keys use
+	// the "user-" namespace.
 	MachineKidPrefix = "machine-"
-	// DefaultMachineTokenLifetime is the default exp for machine tokens
-	// (ADR-0006: 5 minutes).
+	// DefaultMachineTokenLifetime is the default exp for machine tokens.
 	DefaultMachineTokenLifetime = 5 * time.Minute
 )
 
 // MachineTokenClaims are the claims of a machine (m2m) JWT issued by login:
 // {sub: clientId, token_type: machine, roles: [m2m:<callee-scope>],
-// aud: <callee>-api, iss: icaa.world, exp: 5min} (ADR-0006).
+// aud: <callee>-api, iss: icaa.world, exp: 5min}.
 type MachineTokenClaims struct {
 	TokenType TokenType `json:"token_type"`
 	// Roles carries the exact m2m scope string(s) the token was minted for,
@@ -35,8 +34,8 @@ type MachineTokenClaims struct {
 }
 
 // Validate performs custom claim validation. It is a separate type from
-// ICAAClaims on purpose: machine tokens NEVER flow through ValidateAccessToken
-// (ADR-0006), and user routes reject token_type=machine structurally (the
+// ICAAClaims on purpose: machine tokens NEVER flow through the user-token
+// validation path (user routes reject token_type=machine structurally — the
 // access-token validator only accepts "access"/"refresh").
 func (c *MachineTokenClaims) Validate() error {
 	if c.TokenType != TokenTypeMachine {
@@ -100,8 +99,8 @@ func NewMachineTokenSigner(keys map[string]*rsa.PrivateKey, currentKeyID string,
 }
 
 // Sign mints a machine token for the given clientId, with a callee-specific
-// audience and the exact scope(s) that client is allowed (ADR-0006: aud is
-// per-callee, NOT the global icaa-api).
+// audience and the exact scope(s) that client is allowed (aud is per-callee,
+// e.g. "profiles-api", never the global "icaa-api").
 func (s *MachineTokenSigner) Sign(clientID string, audience string, scopes []string) (string, error) {
 	now := time.Now()
 	claims := MachineTokenClaims{
@@ -127,12 +126,12 @@ func (s *MachineTokenSigner) Sign(clientID string, audience string, scopes []str
 	return signed, nil
 }
 
-// ValidateMachineToken verifies a machine JWT against the key cache
-// (ADR-0006): RS256 only with machine-* kid binding, iss=icaa.world,
-// exp required, iat validated, 10s leeway, token_type=machine, sub present.
-// Audience is the callee's own (e.g. "profiles-api", never "icaa-api") and
-// requiredScope must match EXACTLY (never prefix). Fail closed: no key for the
-// kid -> error (401), never "allow".
+// ValidateMachineToken verifies a machine JWT against the key cache: RS256
+// only with machine-* kid binding, iss=icaa.world, exp required, iat
+// validated, 10s leeway, token_type=machine, sub present. Audience is the
+// callee's own (e.g. "profiles-api", never "icaa-api") and requiredScope must
+// match EXACTLY (never prefix). Fail closed: no key for the kid -> error,
+// never "allow".
 func (c *KeyCache) ValidateMachineToken(ctx context.Context, tokenString string, audience string, requiredScope string) (*MachineTokenClaims, error) {
 	claims := &MachineTokenClaims{}
 
@@ -142,9 +141,7 @@ func (c *KeyCache) ValidateMachineToken(ctx context.Context, tokenString string,
 		jwt.WithIssuer(DefaultIssuer),
 		jwt.WithExpirationRequired(),
 		jwt.WithIssuedAt(),
-		// Leeway is 10s, not 30s: machine tokens live only 5 minutes, so a larger
-		// window would honor expired tokens too long (all services run on
-		// AWS-synced clocks).
+		// 10s leeway: tokens live 5 minutes, clocks are NTP-synced.
 		jwt.WithLeeway(10*time.Second),
 	)
 

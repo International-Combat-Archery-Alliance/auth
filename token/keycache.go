@@ -146,57 +146,22 @@ func (c *KeyCache) StartupFetch(ctx context.Context) error {
 // Fail closed with ErrUnknownKey if no key can be found (negative cache
 // short-circuits repeat lookups).
 func (c *KeyCache) Key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
-	c.mu.Lock()
-
-	if key, ok := c.keys[kid]; ok {
-		c.mu.Unlock()
-		return key, nil
-	}
-	// Dev keys are LOCAL-only (WithLocalMode must be set).
-	if c.localMode {
-		if key, ok := c.devKeys[kid]; ok {
-			c.mu.Unlock()
-			return key, nil
-		}
+	if key, err := c.cachedKey(kid); key != nil || err != nil {
+		return key, err
 	}
 
-	if until, neg := c.negative[kid]; neg && time.Now().Before(until) {
-		c.mu.Unlock()
-		return nil, fmt.Errorf("%w: %q", ErrUnknownKey, kid)
+	if err := c.awaitRefetch(ctx); err != nil {
+		c.logger.Warn("lazy public key refetch failed", slog.String("kid", kid), slog.String("error", err.Error()))
 	}
 
-	// Singleflight: wait for an in-flight refetch rather than issuing another.
-	if c.refetchDone == nil {
-		c.refetchDone = make(chan struct{})
-		c.mu.Unlock()
-
-		if err := c.fetch(ctx); err != nil {
-			c.logger.Warn("lazy public key refetch failed", slog.String("kid", kid), slog.String("error", err.Error()))
-		}
-
-		c.mu.Lock()
-		close(c.refetchDone)
-		c.refetchDone = nil
-		c.mu.Unlock()
-	} else {
-		done := c.refetchDone
-		c.mu.Unlock()
-		select {
-		case <-done:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
+	// Re-check after the refetch; still missing -> fail closed and
+	// negative-cache the kid (bounded: stale/over-limit entries pruned).
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if key, ok := c.keys[kid]; ok {
 		return key, nil
 	}
-
-	// Still unknown: negative-cache it, pruning stale/over-limit entries so
-	// attacker-controlled kids cannot grow the cache without bound.
 	now := time.Now()
 	for existingKid, expiresAt := range c.negative {
 		if now.After(expiresAt) {
@@ -218,17 +183,66 @@ func (c *KeyCache) Key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 	return nil, fmt.Errorf("%w: %q", ErrUnknownKey, kid)
 }
 
+// cachedKey returns the installed key for kid, or an error for a
+// negative-cached miss. (nil, nil) means "not cached, worth refetching".
+func (c *KeyCache) cachedKey(kid string) (*rsa.PublicKey, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if key, ok := c.keys[kid]; ok {
+		return key, nil
+	}
+	// Dev keys are LOCAL-only (WithLocalMode must be set).
+	if c.localMode {
+		if key, ok := c.devKeys[kid]; ok {
+			return key, nil
+		}
+	}
+	if until, neg := c.negative[kid]; neg && time.Now().Before(until) {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownKey, kid)
+	}
+	return nil, nil
+}
+
+// awaitRefetch waits for an in-flight lazy refetch, or starts one
+// (singleflight). The lock is never held across the network call.
+func (c *KeyCache) awaitRefetch(ctx context.Context) error {
+	c.mu.Lock()
+	if c.refetchDone != nil {
+		done := c.refetchDone
+		c.mu.Unlock()
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	c.refetchDone = make(chan struct{})
+	c.mu.Unlock()
+
+	err := c.fetch(ctx)
+
+	c.mu.Lock()
+	close(c.refetchDone)
+	c.refetchDone = nil
+	c.mu.Unlock()
+	return err
+}
+
 // fetch pulls keys from the JWKS endpoint into the last-known-good set.
 // Rate-limited to minRefetchInterval; the slot is claimed BEFORE the network
 // call so a concurrent StartupFetch + first lazy miss cannot double-fetch.
 func (c *KeyCache) fetch(ctx context.Context) error {
 	c.mu.Lock()
-	if time.Since(c.lastRefetch) < c.minRefetchInterval {
-		c.mu.Unlock()
+	rateLimited := time.Since(c.lastRefetch) < c.minRefetchInterval
+	if !rateLimited {
+		c.lastRefetch = time.Now()
+	}
+	c.mu.Unlock()
+	if rateLimited {
 		return nil
 	}
-	c.lastRefetch = time.Now()
-	c.mu.Unlock()
 
 	keys, err := c.fetchJWKS(ctx)
 	if err != nil {
@@ -236,11 +250,10 @@ func (c *KeyCache) fetch(ctx context.Context) error {
 	}
 
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	for kid, key := range keys {
 		c.keys[kid] = key
 	}
-	c.mu.Unlock()
-
 	return nil
 }
 

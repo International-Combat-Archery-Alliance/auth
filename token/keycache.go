@@ -120,8 +120,7 @@ func (c *KeyCache) StartupFetch(ctx context.Context) error {
 }
 
 // Key returns the public key for kid, triggering a lazy refetch on a miss.
-// Fail closed with ErrUnknownKey if no key can be found (negative cache
-// short-circuits repeat lookups).
+// Fail closed with ErrUnknownKey if no key can be found.
 func (c *KeyCache) Key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	if key, err := c.cachedKey(kid); key != nil || err != nil {
 		return key, err
@@ -131,18 +130,24 @@ func (c *KeyCache) Key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 		c.logger.Warn("lazy public key refetch failed", slog.String("kid", kid), slog.String("error", err.Error()))
 	}
 
-	// Re-check after the refetch; still missing -> fail closed and
-	// negative-cache the kid (bounded: stale/over-limit entries pruned).
+	// Re-check after the refetch. If a concurrent goroutine recorded a miss
+	// for the same kid, cachedKey returns the negative-cache error, which is
+	// also the correct fail-closed outcome.
+	if key, err := c.cachedKey(kid); key != nil || err != nil {
+		return key, err
+	}
+
+	return nil, c.recordMiss(kid)
+}
+
+// recordMiss negative-caches the kid (bounded) and fails closed.
+func (c *KeyCache) recordMiss(kid string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if key, ok := c.keys[kid]; ok {
-		return key, nil
-	}
 	now := time.Now()
 	c.pruneNegativeLocked(now)
 	c.negative[kid] = now.Add(c.minRefetchInterval)
-	return nil, fmt.Errorf("%w: %q", ErrUnknownKey, kid)
+	return fmt.Errorf("%w: %q", ErrUnknownKey, kid)
 }
 
 // pruneNegativeLocked drops stale entries and enforces the size bound.

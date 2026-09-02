@@ -32,6 +32,7 @@ type jwkKey struct {
 const (
 	maxJWKSBodySize = 1 << 20 // 1 MiB
 	minKeyBits      = 2048    // RSA-2048 or stronger
+	maxKeyBits      = 8192    // cap the exponentiation cost of a hostile document
 )
 
 func (c *KeyCache) fetchJWKS(ctx context.Context) (map[string]*rsa.PublicKey, error) {
@@ -69,8 +70,8 @@ func (c *KeyCache) fetchJWKS(ctx context.Context) (map[string]*rsa.PublicKey, er
 }
 
 // parseJWKS installs only signature-capable RSA keys (use=sig, alg=RS256,
-// modulus >= 2048 bits, odd exponent > 1). Invalid entries are skipped so one
-// bad key can't poison the document (verification fails closed per-key).
+// 2048..8192-bit modulus, small odd exponent). Invalid entries are skipped so
+// one bad key can't poison the document (verification fails closed per-key).
 func (c *KeyCache) parseJWKS(doc jwksDocument) map[string]*rsa.PublicKey {
 	keys := make(map[string]*rsa.PublicKey, len(doc.Keys))
 	skipped := 0
@@ -93,11 +94,17 @@ func (c *KeyCache) parseJWKS(doc jwksDocument) map[string]*rsa.PublicKey {
 			continue
 		}
 		modulus := new(big.Int).SetBytes(nBytes)
-		if modulus.BitLen() < minKeyBits {
+		if modulus.BitLen() < minKeyBits || modulus.BitLen() > maxKeyBits {
 			skipped++
 			continue
 		}
-		// Exponent is an unsigned big-endian integer, usually 65537.
+		// Exponent is an unsigned big-endian integer, usually 65537. Bound the
+		// byte length so the int accumulation below can never overflow into a
+		// wrapped value, which would defeat the weak-exponent check.
+		if len(eBytes) == 0 || len(eBytes) > 4 {
+			skipped++
+			continue
+		}
 		var e int
 		for _, b := range eBytes {
 			e = e<<8 | int(b)

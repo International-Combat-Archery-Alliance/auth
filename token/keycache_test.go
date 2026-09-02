@@ -273,14 +273,16 @@ func TestKeyCacheMalformedEntriesSkippedNotFatal(t *testing.T) {
 		{Kty: "RSA", Kid: "machine-good", Use: "sig", Alg: "RS256",
 			N: base64.RawURLEncoding.EncodeToString(good["machine-good"].PublicKey.N.Bytes()),
 			E: base64.RawURLEncoding.EncodeToString(big.NewInt(int64(good["machine-good"].PublicKey.E)).Bytes())},
-		{Kty: "RSA", Kid: "machine-e1", N: "AQ", E: "AQ"},                                                               // e = 1
-		{Kty: "RSA", Kid: "machine-even", N: "AQ", E: "Ag"},                                                             // e = 2 (even)
-		{Kty: "RSA", Kid: "machine-weak", N: base64.RawURLEncoding.EncodeToString(weak.PublicKey.N.Bytes()), E: "AQAB"}, // 1024-bit
-		{Kty: "EC", Kid: "machine-ec", N: "AQ", E: "AQAB"},                                                              // wrong kty
-		{Kty: "RSA", Kid: "machine-enc", Use: "enc", N: "AQ", E: "AQAB"},                                                // wrong use
-		{Kty: "RSA", Kid: "machine-alg", Alg: "HS256", N: "AQ", E: "AQAB"},                                              // wrong alg
-		{Kty: "RSA", Kid: "machine-badn", N: "!!!!", E: "AQAB"},                                                         // invalid base64
-		{Kty: "RSA", Kid: "", N: "AQ", E: "AQAB"},                                                                       // missing kid
+		{Kty: "RSA", Kid: "machine-e1", N: "AQ", E: "AQ"},                                                                                    // e = 1
+		{Kty: "RSA", Kid: "machine-even", N: "AQ", E: "Ag"},                                                                                  // e = 2 (even)
+		{Kty: "RSA", Kid: "machine-weak", N: base64.RawURLEncoding.EncodeToString(weak.PublicKey.N.Bytes()), E: "AQAB"},                      // 1024-bit
+		{Kty: "EC", Kid: "machine-ec", N: "AQ", E: "AQAB"},                                                                                   // wrong kty
+		{Kty: "RSA", Kid: "machine-enc", Use: "enc", N: "AQ", E: "AQAB"},                                                                     // wrong use
+		{Kty: "RSA", Kid: "machine-alg", Alg: "HS256", N: "AQ", E: "AQAB"},                                                                   // wrong alg
+		{Kty: "RSA", Kid: "machine-badn", N: "!!!!", E: "AQAB"},                                                                              // invalid base64
+		{Kty: "RSA", Kid: "", N: "AQ", E: "AQAB"},                                                                                            // missing kid
+		{Kty: "RSA", Kid: "machine-elo", N: "AQ", E: base64.RawURLEncoding.EncodeToString([]byte{0, 0, 0, 5, 1})},                            // 40-bit exponent (overflow hazard)
+		{Kty: "RSA", Kid: "machine-huge", N: base64.RawURLEncoding.EncodeToString(new(big.Int).Lsh(big.NewInt(1), 9000).Bytes()), E: "AQAB"}, // 9001-bit modulus
 	}}
 
 	cache := NewKeyCache("", WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
@@ -289,7 +291,7 @@ func TestKeyCacheMalformedEntriesSkippedNotFatal(t *testing.T) {
 	if _, ok := keys["machine-good"]; !ok {
 		t.Fatal("valid key must still be installed despite malformed siblings")
 	}
-	invalid := []string{"machine-e1", "machine-even", "machine-weak", "machine-ec", "machine-enc", "machine-alg", "machine-badn"}
+	invalid := []string{"machine-e1", "machine-even", "machine-weak", "machine-ec", "machine-enc", "machine-alg", "machine-badn", "machine-elo", "machine-huge"}
 	for _, kid := range invalid {
 		if _, ok := keys[kid]; ok {
 			t.Fatalf("invalid entry %q must be skipped", kid)

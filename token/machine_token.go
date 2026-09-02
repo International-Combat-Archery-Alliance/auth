@@ -22,13 +22,13 @@ const (
 	DefaultMachineTokenLifetime = 5 * time.Minute
 )
 
-// MachineTokenClaims are the claims of a machine (m2m) JWT issued by login:
+// MachineTokenClaims are the claims of a machine (m2m) JWT:
 // {sub: clientId, token_type: machine, roles: [m2m:<callee-scope>],
 // aud: <callee>-api, iss: icaa.world, exp: 5min}.
 type MachineTokenClaims struct {
 	TokenType TokenType `json:"token_type"`
-	// Roles carries the exact m2m scope string(s) the token was minted for,
-	// e.g. ["m2m:player-profiles"]. Scope matching is EXACT, never prefix.
+	// Roles carries the exact m2m scope string(s) the token was minted for.
+	// Scope matching is EXACT, never prefix.
 	Roles []string `json:"roles"`
 	jwt.RegisteredClaims
 }
@@ -45,9 +45,7 @@ func (c *MachineTokenClaims) Validate() error {
 }
 
 // MachineTokenSigner signs machine JWTs (RS256, kid namespace "machine-*").
-// It is used by login (the only service that ever holds the private keys) and
-// by local dev / tests. Services other than login must never receive private
-// keys.
+// Private keys must never be distributed to token verifiers.
 type MachineTokenSigner struct {
 	keys         map[string]*rsa.PrivateKey
 	currentKeyID string
@@ -100,7 +98,7 @@ func NewMachineTokenSigner(keys map[string]*rsa.PrivateKey, currentKeyID string,
 
 // Sign mints a machine token for the given clientId, with a callee-specific
 // audience and the exact scope(s) that client is allowed (aud is per-callee,
-// e.g. "profiles-api", never the global "icaa-api").
+// never a global audience).
 func (s *MachineTokenSigner) Sign(clientID string, audience string, scopes []string) (string, error) {
 	now := time.Now()
 	claims := MachineTokenClaims{
@@ -128,10 +126,9 @@ func (s *MachineTokenSigner) Sign(clientID string, audience string, scopes []str
 
 // ValidateMachineToken verifies a machine JWT against the key cache: RS256
 // only with machine-* kid binding, iss=icaa.world, exp required, iat
-// validated, 10s leeway, token_type=machine, sub present. Audience is the
-// callee's own (e.g. "profiles-api", never "icaa-api") and requiredScope must
-// match EXACTLY (never prefix). Fail closed: no key for the kid -> error,
-// never "allow".
+// validated, 10s leeway, token_type=machine, sub present. Audience is
+// callee-specific and requiredScope must match EXACTLY (never prefix). Fail
+// closed: no key for the kid -> error, never "allow".
 func (c *KeyCache) ValidateMachineToken(ctx context.Context, tokenString string, audience string, requiredScope string) (*MachineTokenClaims, error) {
 	claims := &MachineTokenClaims{}
 

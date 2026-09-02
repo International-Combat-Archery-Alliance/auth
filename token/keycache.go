@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // DefaultMinRefetchInterval is the minimum time between lazy refetches of the
@@ -18,10 +20,13 @@ const DefaultMinRefetchInterval = 30 * time.Second
 // kids cannot grow memory without bound.
 const maxNegativeEntries = 1024
 
+// jwksFetchKey dedupes JWKS fetches across callers (singleflight key).
+const jwksFetchKey = "jwks"
+
 // KeyCache holds the RSA public keys used to verify ICAA JWTs, fetched from
-// login's JWKS endpoint. Fetch is non-fatal at startup, verification fails
-// closed, unknown kids trigger a rate-limited lazy refetch (singleflight, 30s
-// min interval, bounded negative cache), and last-known-good keys survive
+// a configured JWKS endpoint. Fetch is non-fatal at startup, verification
+// fails closed, unknown kids trigger a rate-limited lazy refetch (singleflight,
+// 30s min interval, bounded negative cache), and last-known-good keys survive
 // endpoint failures. Only kty=RSA, use=sig, alg=RS256 keys >= 2048 bits are
 // installed; malformed entries are skipped, never fatal. Dev keys
 // (WithDevKeys) are only consulted with WithLocalMode also set.
@@ -42,8 +47,9 @@ type KeyCache struct {
 	// and are pruned on insert (bounded by maxNegativeEntries).
 	negative    map[string]time.Time
 	lastRefetch time.Time
-	// refetchDone is non-nil while a lazy refetch is in flight (singleflight).
-	refetchDone chan struct{}
+	// group dedupes JWKS fetches: one goroutine fetches, all misses share
+	// the result.
+	group singleflight.Group
 }
 
 // KeyCacheOption configures a KeyCache.
@@ -192,30 +198,19 @@ func (c *KeyCache) cachedKey(kid string) (*rsa.PublicKey, error) {
 	return nil, nil
 }
 
-// awaitRefetch waits for an in-flight lazy refetch, or starts one
-// (singleflight). The lock is never held across the network call.
+// awaitRefetch starts a JWKS fetch, or joins one already in flight. Only one
+// goroutine ever performs the fetch (singleflight); the rest share its
+// result, and the fetch itself is rate-limited by fetch().
 func (c *KeyCache) awaitRefetch(ctx context.Context) error {
-	c.mu.Lock()
-	if c.refetchDone != nil {
-		done := c.refetchDone
-		c.mu.Unlock()
-		select {
-		case <-done:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	ch := c.group.DoChan(jwksFetchKey, func() (any, error) {
+		return nil, c.fetch(ctx)
+	})
+	select {
+	case res := <-ch:
+		return res.Err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	c.refetchDone = make(chan struct{})
-	c.mu.Unlock()
-
-	err := c.fetch(ctx)
-
-	c.mu.Lock()
-	close(c.refetchDone)
-	c.refetchDone = nil
-	c.mu.Unlock()
-	return err
 }
 
 // fetch pulls keys from the JWKS endpoint into the last-known-good set.

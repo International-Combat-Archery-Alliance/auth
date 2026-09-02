@@ -14,7 +14,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// jwksDocument mirrors the JSON served by GET /login/.well-known/jwks.json.
+// jwksDocument mirrors the JSON served by a JWKS endpoint.
 type jwksDocument struct {
 	Keys []jwkKey `json:"keys"`
 }
@@ -31,7 +31,7 @@ type jwkKey struct {
 // Bounds for fetched documents and installed keys.
 const (
 	maxJWKSBodySize = 1 << 20 // 1 MiB
-	minKeyBits      = 2048    // login signs with 2048-bit keys
+	minKeyBits      = 2048    // RSA-2048 or stronger
 )
 
 func (c *KeyCache) fetchJWKS(ctx context.Context) (map[string]*rsa.PublicKey, error) {

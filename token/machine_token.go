@@ -158,10 +158,6 @@ func (c *KeyCache) ValidateMachineToken(ctx context.Context, tokenString string,
 	if !tok.Valid {
 		return nil, fmt.Errorf("machine token is invalid")
 	}
-	if err := claims.Validate(); err != nil {
-		return nil, err
-	}
-	// jwt/v5 auto-invokes Validate(); explicit call kept as defense-in-depth.
 	if claims.Subject == "" {
 		return nil, fmt.Errorf("machine token missing sub (clientId)")
 	}

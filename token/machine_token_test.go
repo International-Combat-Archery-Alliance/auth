@@ -2,6 +2,8 @@ package token
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"errors"
 	"testing"
@@ -69,6 +71,28 @@ func TestValidateMachineTokenRejections(t *testing.T) {
 	t.Run("wrong audience", func(t *testing.T) {
 		if _, err := cache.ValidateMachineToken(ctx, validToken(t, keys, "machine-01"), "voting-api", testScope); err == nil {
 			t.Fatal("expected aud mismatch to fail")
+		}
+	})
+
+	t.Run("multi-aud rejected (exact, not contains)", func(t *testing.T) {
+		claims := MachineTokenClaims{
+			TokenType: TokenTypeMachine,
+			Roles:     []string{testScope},
+			RegisteredClaims: jwt.RegisteredClaims{
+				Subject:   testClientID,
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
+				Issuer:    DefaultIssuer,
+				Audience:  jwt.ClaimStrings{testAudience, "voting-api"},
+			},
+		}
+		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+		tok.Header["kid"] = "machine-01"
+		signed, err := tok.SignedString(keys["machine-01"])
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		if _, err := cache.ValidateMachineToken(ctx, signed, testAudience, testScope); err == nil {
+			t.Fatal("expected multi-aud token to be rejected (audience must match exactly)")
 		}
 	})
 
@@ -223,6 +247,28 @@ func TestValidateMachineTokenKidNamespace(t *testing.T) {
 		}
 		if _, err := cache.ValidateMachineToken(context.Background(), signed, testAudience, testScope); err == nil {
 			t.Fatal("expected missing kid to fail")
+		}
+	})
+}
+
+func TestNewMachineTokenSignerValidation(t *testing.T) {
+	keys := rsaKeys(t, "machine-01")
+
+	t.Run("non-machine kid rejected", func(t *testing.T) {
+		bad := map[string]*rsa.PrivateKey{"user-01": keys["machine-01"]}
+		if _, err := NewMachineTokenSigner(bad, "user-01"); err == nil {
+			t.Fatal("expected non-machine kid to be rejected")
+		}
+	})
+
+	t.Run("weak key rejected", func(t *testing.T) {
+		weak, err := rsa.GenerateKey(rand.Reader, 1024)
+		if err != nil {
+			t.Fatalf("generate weak key: %v", err)
+		}
+		weakKeys := map[string]*rsa.PrivateKey{"machine-weak": weak}
+		if _, err := NewMachineTokenSigner(weakKeys, "machine-weak"); err == nil {
+			t.Fatal("expected <2048-bit signing key to be rejected")
 		}
 	})
 }

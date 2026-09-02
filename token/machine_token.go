@@ -73,13 +73,27 @@ func WithMachineTokenLifetime(d time.Duration) MachineTokenSignerOption {
 
 // NewMachineTokenSigner creates a signer for the given RS256 private keys.
 // currentKeyID selects which key signs new tokens; all keys remain available
-// so a retired kid can still be validated during rotation.
+// so a retired kid can still be validated during rotation. Keys must use the
+// machine- namespace and be at least 2048 bits, matching what the verifier's
+// JWKS filter accepts (a key that fails that filter would mint tokens that can
+// never verify).
 func NewMachineTokenSigner(keys map[string]*rsa.PrivateKey, currentKeyID string, opts ...MachineTokenSignerOption) (*MachineTokenSigner, error) {
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("no machine signing keys provided")
 	}
 	if _, ok := keys[currentKeyID]; !ok {
 		return nil, fmt.Errorf("current key ID %q not found in signing keys", currentKeyID)
+	}
+	for kid, key := range keys {
+		if key == nil {
+			return nil, fmt.Errorf("machine signing key %q is nil", kid)
+		}
+		if !strings.HasPrefix(kid, MachineKidPrefix) {
+			return nil, fmt.Errorf("machine signing key %q must use %q* namespace", kid, MachineKidPrefix)
+		}
+		if key.N.BitLen() < minKeyBits {
+			return nil, fmt.Errorf("machine signing key %q must be at least %d bits", kid, minKeyBits)
+		}
 	}
 
 	s := &MachineTokenSigner{
@@ -125,16 +139,16 @@ func (s *MachineTokenSigner) Sign(clientID string, audience string, scopes []str
 }
 
 // ValidateMachineToken verifies a machine JWT against the key cache: RS256
-// only with machine-* kid binding, iss=icaa.world, exp required, iat
-// validated, 10s leeway, token_type=machine, sub present. Audience is
-// callee-specific and requiredScope must match EXACTLY (never prefix). Fail
-// closed: no key for the kid -> error, never "allow".
+// only with machine-* kid binding, iss=icaa.world, exp required, future iat
+// rejected, 10s leeway, token_type=machine, sub present. Audience must match
+// EXACTLY (single aud value, never "contains") and requiredScope must match
+// EXACTLY (never prefix). Fail closed: no key for the kid -> error, never
+// "allow".
 func (c *KeyCache) ValidateMachineToken(ctx context.Context, tokenString string, audience string, requiredScope string) (*MachineTokenClaims, error) {
 	claims := &MachineTokenClaims{}
 
 	parser := jwt.NewParser(
 		jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
-		jwt.WithAudience(audience),
 		jwt.WithIssuer(DefaultIssuer),
 		jwt.WithExpirationRequired(),
 		jwt.WithIssuedAt(),
@@ -158,6 +172,11 @@ func (c *KeyCache) ValidateMachineToken(ctx context.Context, tokenString string,
 	if !tok.Valid {
 		return nil, fmt.Errorf("machine token is invalid")
 	}
+	// EXACT audience match, never "contains": a token minted for another
+	// callee must not verify here even if its aud list includes ours.
+	if len(claims.Audience) != 1 || claims.Audience[0] != audience {
+		return nil, fmt.Errorf("machine token audience mismatch: expected %q", audience)
+	}
 	if claims.Subject == "" {
 		return nil, fmt.Errorf("machine token missing sub (clientId)")
 	}
@@ -171,8 +190,8 @@ func (c *KeyCache) ValidateMachineToken(ctx context.Context, tokenString string,
 }
 
 // GenerateMachineDevKeypair creates a development RSA keypair for local
-// development (LOCAL mode). Prod code must assert !isLocal() before using it;
-// auth lib callers only ever install the public key via WithDevKeys.
+// development only. The private key must never be shipped to production;
+// verification installs only the public key via WithDevKeys.
 func GenerateMachineDevKeypair() (*rsa.PrivateKey, *rsa.PublicKey, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

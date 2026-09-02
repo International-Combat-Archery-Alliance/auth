@@ -1,6 +1,7 @@
 package token
 
 import (
+	"container/list"
 	"context"
 	"crypto/rsa"
 	"fmt"
@@ -43,13 +44,24 @@ type KeyCache struct {
 	// devKeys are inert unless localMode is set (double opt-in).
 	devKeys   map[string]*rsa.PublicKey
 	localMode bool
-	// negative caches unknown kids to bound refetch hammering; entries expire
-	// and are pruned on insert (bounded by maxNegativeEntries).
-	negative    map[string]time.Time
-	lastRefetch time.Time
+	// negative caches unknown kids to bound refetch hammering. It is a map
+	// from kid to its list element (O(1) lookup) plus a list ordered by expiry
+	// (front = soonest). New entries are always the latest-expiring, so
+	// appends are O(1), pruning visits only the expired prefix, and eviction
+	// drops the soonest-expiring entry.
+	negative     map[string]*list.Element
+	negativeList *list.List
+	lastRefetch  time.Time
 	// group dedupes JWKS fetches: one goroutine fetches, all misses share
 	// the result.
 	group singleflight.Group
+}
+
+// negativeEntry is one negative-cache entry: an unknown kid and when it stops
+// being cached.
+type negativeEntry struct {
+	kid       string
+	expiresAt time.Time
 }
 
 // KeyCacheOption configures a KeyCache.
@@ -104,7 +116,8 @@ func NewKeyCache(jwksURL string, opts ...KeyCacheOption) *KeyCache {
 		logger:             slog.Default(),
 		keys:               make(map[string]*rsa.PublicKey),
 		devKeys:            make(map[string]*rsa.PublicKey),
-		negative:           make(map[string]time.Time),
+		negative:           make(map[string]*list.Element),
+		negativeList:       list.New(),
 	}
 
 	for _, opt := range opts {
@@ -148,35 +161,59 @@ func (c *KeyCache) Key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 	return nil, c.recordMiss(kid)
 }
 
-// recordMiss negative-caches the kid (bounded) and fails closed.
+// recordMiss negative-caches the kid (bounded) and fails closed. New entries
+// append at the tail (newest expiry); re-misses just move the entry to the
+// tail. Stale pruning and full-cache eviction operate on the front, so they
+// never scan the whole map under lock.
 func (c *KeyCache) recordMiss(kid string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
+	expiresAt := now.Add(c.minRefetchInterval)
+	if el, exists := c.negative[kid]; exists {
+		el.Value.(*negativeEntry).expiresAt = expiresAt
+		c.negativeList.MoveToBack(el)
+		return unknownKeyErr(kid)
+	}
 	c.pruneNegativeLocked(now)
-	c.negative[kid] = now.Add(c.minRefetchInterval)
-	return fmt.Errorf("%w: %q", ErrUnknownKey, kid)
+	if c.negativeList.Len() >= maxNegativeEntries {
+		c.evictNegativeLocked()
+	}
+	el := c.negativeList.PushBack(&negativeEntry{kid: kid, expiresAt: expiresAt})
+	c.negative[kid] = el
+	return unknownKeyErr(kid)
 }
 
-// pruneNegativeLocked drops stale entries and enforces the size bound.
-// Caller must hold c.mu.
+// pruneNegativeLocked drops stale entries from the front of the list. Only the
+// soonest-expiring entries can be stale, so this visits just the expired
+// prefix. Caller must hold c.mu.
 func (c *KeyCache) pruneNegativeLocked(now time.Time) {
-	for existingKid, expiresAt := range c.negative {
-		if now.After(expiresAt) {
-			delete(c.negative, existingKid)
+	front := c.negativeList.Front()
+	for front != nil {
+		entry := front.Value.(*negativeEntry)
+		if !now.After(entry.expiresAt) {
+			return
 		}
-		if len(c.negative) < maxNegativeEntries {
-			break
-		}
+		next := front.Next()
+		delete(c.negative, entry.kid)
+		c.negativeList.Remove(front)
+		front = next
 	}
-	if len(c.negative) >= maxNegativeEntries {
-		for existingKid := range c.negative {
-			delete(c.negative, existingKid)
-			if len(c.negative) < maxNegativeEntries {
-				break
-			}
-		}
+}
+
+// evictNegativeLocked removes the soonest-expiring entry to bound the cache
+// when it is full of fresh entries. Caller must hold c.mu.
+func (c *KeyCache) evictNegativeLocked() {
+	if front := c.negativeList.Front(); front != nil {
+		entry := front.Value.(*negativeEntry)
+		delete(c.negative, entry.kid)
+		c.negativeList.Remove(front)
 	}
+}
+
+// unknownKeyErr is the canonical fail-closed error for an unknown kid.
+func unknownKeyErr(kid string) error {
+	return fmt.Errorf("%w: %q", ErrUnknownKey, kid)
 }
 
 // cachedKey returns the installed key for kid, or an error for a
@@ -194,8 +231,8 @@ func (c *KeyCache) cachedKey(kid string) (*rsa.PublicKey, error) {
 			return key, nil
 		}
 	}
-	if until, neg := c.negative[kid]; neg && time.Now().Before(until) {
-		return nil, fmt.Errorf("%w: %q", ErrUnknownKey, kid)
+	if el, ok := c.negative[kid]; ok && time.Now().Before(el.Value.(*negativeEntry).expiresAt) {
+		return nil, unknownKeyErr(kid)
 	}
 	return nil, nil
 }
@@ -204,8 +241,11 @@ func (c *KeyCache) cachedKey(kid string) (*rsa.PublicKey, error) {
 // goroutine ever performs the fetch (singleflight); the rest share its
 // result, and the fetch itself is rate-limited by fetch().
 func (c *KeyCache) awaitRefetch(ctx context.Context) error {
+	// The shared fetch must not inherit the first caller's cancellation: a
+	// single canceled request must not abort key refresh for every concurrent
+	// caller. WithoutCancel keeps the caller's values without its lifetime.
 	ch := c.group.DoChan(jwksFetchKey, func() (any, error) {
-		return nil, c.fetch(ctx)
+		return nil, c.fetch(context.WithoutCancel(ctx))
 	})
 	select {
 	case res := <-ch:

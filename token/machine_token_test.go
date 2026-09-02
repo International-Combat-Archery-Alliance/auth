@@ -2,42 +2,14 @@ package token
 
 import (
 	"context"
-	"crypto/rsa"
 	"crypto/x509"
 	"errors"
-	"log/slog"
-	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/International-Combat-Archery-Alliance/auth"
 	"github.com/golang-jwt/jwt/v5"
 )
-
-const (
-	testClientID = "event-registration"
-	testAudience = "profiles-api"
-	testScope    = "m2m:player-profiles"
-)
-
-// setupVerifiedCache returns a KeyCache whose JWKS endpoint serves the given
-// keys under their own kids.
-func setupVerifiedCache(t *testing.T, keys map[string]*rsa.PrivateKey) *KeyCache {
-	t.Helper()
-	server := newJWKSServer()
-	for kid, priv := range keys {
-		server.addKey(kid, priv)
-	}
-	ts := httptest.NewServer(server)
-	t.Cleanup(ts.Close)
-
-	return NewKeyCache(ts.URL, WithKeyCacheLogger(slog.New(slog.DiscardHandler)))
-}
-
-func validToken(t *testing.T, keys map[string]*rsa.PrivateKey, kid string) string {
-	t.Helper()
-	return signMachine(t, keys[kid], testClientID, testAudience, []string{testScope}, kid)
-}
 
 func TestValidateMachineTokenHappyPath(t *testing.T) {
 	keys := rsaKeys(t, "machine-01")
@@ -361,37 +333,4 @@ func TestValidateMachineTokenUnknownKidBubblesErrUnknownKey(t *testing.T) {
 	if !errors.Is(err, ErrUnknownKey) {
 		t.Fatalf("expected ErrUnknownKey reachable via errors.Is, got %v", err)
 	}
-}
-
-// --- helpers ---
-
-func signMachineAt(t *testing.T, priv *rsa.PrivateKey, clientID string, audience string, scopes []string, kid string, exp time.Time) string {
-	t.Helper()
-	claims := MachineTokenClaims{
-		TokenType: TokenTypeMachine,
-		Roles:     scopes,
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   clientID,
-			ExpiresAt: jwt.NewNumericDate(exp),
-			IssuedAt:  jwt.NewNumericDate(time.Now().Add(-time.Hour)),
-			Issuer:    DefaultIssuer,
-			Audience:  jwt.ClaimStrings{audience},
-		},
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	tok.Header["kid"] = kid
-	signed, err := tok.SignedString(priv)
-	if err != nil {
-		t.Fatalf("sign: %v", err)
-	}
-	return signed
-}
-
-func slicesContains(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
 }

@@ -140,13 +140,16 @@ func TestValidateMachineTokenRejections(t *testing.T) {
 	})
 
 	t.Run("token_type access", func(t *testing.T) {
+		// Scope, audience, issuer, and expiry all match: the ONLY reason
+		// this fails must be token_type.
 		claims := ICAAClaims{
 			Email:     "user@icaa.world",
-			Roles:     []auth.Role{auth.RoleAdmin},
+			Roles:     []auth.Role{auth.Role(testScope)},
 			TokenType: TokenTypeAccess,
 			RegisteredClaims: jwt.RegisteredClaims{
 				Subject:   testClientID,
 				ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
+				IssuedAt:  jwt.NewNumericDate(time.Now()),
 				Issuer:    DefaultIssuer,
 				Audience:  jwt.ClaimStrings{testAudience},
 			},

@@ -73,6 +73,16 @@ func (c *KeyCache) fetchJWKS(ctx context.Context) (map[string]*rsa.PublicKey, er
 // 2048..8192-bit modulus, small odd exponent). Invalid entries are skipped so
 // one bad key can't poison the document (verification fails closed per-key).
 func (c *KeyCache) parseJWKS(doc jwksDocument) map[string]*rsa.PublicKey {
+	keys, skipped := filterJWKSKeys(doc)
+	if skipped > 0 {
+		c.logger.Warn("skipped invalid jwks entries", slog.Int("count", skipped))
+	}
+	return keys
+}
+
+// filterJWKSKeys applies the key filter shared by the fetch path.
+// It returns the installed keys and the skipped-entry count.
+func filterJWKSKeys(doc jwksDocument) (map[string]*rsa.PublicKey, int) {
 	keys := make(map[string]*rsa.PublicKey, len(doc.Keys))
 	skipped := 0
 	for _, k := range doc.Keys {
@@ -119,8 +129,5 @@ func (c *KeyCache) parseJWKS(doc jwksDocument) map[string]*rsa.PublicKey {
 			E: e,
 		}
 	}
-	if skipped > 0 {
-		c.logger.Warn("skipped invalid jwks entries", slog.Int("count", skipped))
-	}
-	return keys
+	return keys, skipped
 }

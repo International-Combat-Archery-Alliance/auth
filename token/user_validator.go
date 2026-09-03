@@ -13,13 +13,14 @@ import (
 // userLeeway is the clock-skew tolerance for user tokens.
 const userLeeway = 30 * time.Second
 
-// userParser builds the RS256-only parser for the user-token paths. It pins
-// the signing method, enforces issuer and audience, and requires exp and iat.
-func userParser() *jwt.Parser {
+// buildUserParser returns an RS256-only parser for user tokens with the
+// given expected issuer and audience. It pins the signing method and
+// requires exp and iat.
+func buildUserParser(issuer, audience string) *jwt.Parser {
 	return jwt.NewParser(
 		jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
-		jwt.WithIssuer(DefaultIssuer),
-		jwt.WithAudience(DefaultAudience),
+		jwt.WithIssuer(issuer),
+		jwt.WithAudience(audience),
 		jwt.WithExpirationRequired(),
 		jwt.WithIssuedAt(),
 		jwt.WithLeeway(userLeeway),
@@ -28,10 +29,10 @@ func userParser() *jwt.Parser {
 
 // parseUserTokenClaims parses tokenString as ICAAClaims, resolving the kid
 // through lookup. Only RS256 tokens with a user- namespaced kid are accepted.
-func parseUserTokenClaims(tokenString string, lookup func(kid string) (*rsa.PublicKey, error)) (*ICAAClaims, error) {
+func parseUserTokenClaims(parser *jwt.Parser, tokenString string, lookup func(kid string) (*rsa.PublicKey, error)) (*ICAAClaims, error) {
 	claims := &ICAAClaims{}
 
-	tok, err := userParser().ParseWithClaims(tokenString, claims, func(t *jwt.Token) (any, error) {
+	tok, err := parser.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (any, error) {
 		kid, ok := t.Header["kid"].(string)
 		if !ok || kid == "" {
 			return nil, fmt.Errorf("token missing kid")
@@ -53,7 +54,7 @@ func parseUserTokenClaims(tokenString string, lookup func(kid string) (*rsa.Publ
 // validateUserToken parses tokenString as ICAAClaims with user-* kid binding
 // and returns the claims. Callers enforce the expected token_type.
 func (c *KeyCache) validateUserToken(ctx context.Context, tokenString string) (*ICAAClaims, error) {
-	return parseUserTokenClaims(tokenString, func(kid string) (*rsa.PublicKey, error) {
+	return parseUserTokenClaims(c.userParser, tokenString, func(kid string) (*rsa.PublicKey, error) {
 		return c.Key(ctx, kid)
 	})
 }

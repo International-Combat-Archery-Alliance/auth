@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -37,6 +38,12 @@ type KeyCache struct {
 
 	minRefetchInterval time.Duration
 	logger             *slog.Logger
+
+	// userIssuer and userAudience are the iss/aud claims the user-token
+	// validators expect. userParser is prebuilt from them.
+	userIssuer   string
+	userAudience string
+	userParser   *jwt.Parser
 
 	mu sync.Mutex
 	// keys is last-known-good (failed fetches never remove entries).
@@ -96,6 +103,22 @@ func WithLocalMode() KeyCacheOption {
 	}
 }
 
+// WithExpectedUserIssuer overrides the iss claim the user-token validators
+// expect (default: icaa.world). It must match the signer's iss.
+func WithExpectedUserIssuer(issuer string) KeyCacheOption {
+	return func(k *KeyCache) {
+		k.userIssuer = issuer
+	}
+}
+
+// WithExpectedUserAudience overrides the aud claim the user-token validators
+// expect (default: icaa-api). It must match the signer's aud.
+func WithExpectedUserAudience(audience string) KeyCacheOption {
+	return func(k *KeyCache) {
+		k.userAudience = audience
+	}
+}
+
 // WithDevKeys installs a dev public key set. Only effective with WithLocalMode.
 func WithDevKeys(keys map[string]*rsa.PublicKey) KeyCacheOption {
 	return func(k *KeyCache) {
@@ -114,6 +137,8 @@ func NewKeyCache(jwksURL string, opts ...KeyCacheOption) *KeyCache {
 		httpClient:         &http.Client{Timeout: 5 * time.Second},
 		minRefetchInterval: DefaultMinRefetchInterval,
 		logger:             slog.Default(),
+		userIssuer:         DefaultIssuer,
+		userAudience:       DefaultAudience,
 		keys:               make(map[string]*rsa.PublicKey),
 		devKeys:            make(map[string]*rsa.PublicKey),
 		negative:           make(map[string]*list.Element),
@@ -123,6 +148,8 @@ func NewKeyCache(jwksURL string, opts ...KeyCacheOption) *KeyCache {
 	for _, opt := range opts {
 		opt(k)
 	}
+
+	k.userParser = buildUserParser(k.userIssuer, k.userAudience)
 
 	return k
 }

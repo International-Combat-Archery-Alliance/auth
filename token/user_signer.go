@@ -25,12 +25,14 @@ type UserTokenSigner struct {
 	audience             string
 	accessTokenLifetime  time.Duration
 	refreshTokenLifetime time.Duration
+	parser               *jwt.Parser
 }
 
 // UserTokenSignerOption configures a UserTokenSigner.
 type UserTokenSignerOption func(*UserTokenSigner)
 
 // WithUserTokenIssuer overrides the iss claim (default: icaa.world).
+// The validator must expect the same value (see WithExpectedUserIssuer).
 func WithUserTokenIssuer(issuer string) UserTokenSignerOption {
 	return func(s *UserTokenSigner) {
 		s.issuer = issuer
@@ -38,6 +40,7 @@ func WithUserTokenIssuer(issuer string) UserTokenSignerOption {
 }
 
 // WithUserTokenAudience overrides the aud claim (default: icaa-api).
+// The validator must expect the same value (see WithExpectedUserAudience).
 func WithUserTokenAudience(audience string) UserTokenSignerOption {
 	return func(s *UserTokenSigner) {
 		s.audience = audience
@@ -94,6 +97,8 @@ func NewUserTokenSigner(keys map[string]*rsa.PrivateKey, currentKeyID string, op
 	for _, opt := range opts {
 		opt(s)
 	}
+
+	s.parser = buildUserParser(s.issuer, s.audience)
 
 	return s, nil
 }
@@ -180,7 +185,7 @@ func (s *UserTokenSigner) localLookup(kid string) (*rsa.PublicKey, error) {
 // ValidateUserAccessToken verifies an access token against the signer's own
 // keys and returns the claims.
 func (s *UserTokenSigner) ValidateUserAccessToken(_ context.Context, tokenString string) (*ICAAClaims, error) {
-	claims, err := parseUserTokenClaims(tokenString, s.localLookup)
+	claims, err := parseUserTokenClaims(s.parser, tokenString, s.localLookup)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +201,7 @@ func (s *UserTokenSigner) ValidateUserAccessToken(_ context.Context, tokenString
 // ValidateUserRefreshToken verifies a refresh token against the signer's own
 // keys and returns the token ID.
 func (s *UserTokenSigner) ValidateUserRefreshToken(_ context.Context, tokenString string) (string, error) {
-	claims, err := parseUserTokenClaims(tokenString, s.localLookup)
+	claims, err := parseUserTokenClaims(s.parser, tokenString, s.localLookup)
 	if err != nil {
 		return "", err
 	}

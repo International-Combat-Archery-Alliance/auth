@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -267,5 +268,39 @@ func TestUserDevKeysLocalOnly(t *testing.T) {
 	local := NewKeyCache("", WithLocalMode(), WithDevKeys(devPubs))
 	if _, err := local.ValidateUserAccessToken(context.Background(), tok); err != nil {
 		t.Fatalf("dev key should verify with local opt-in: %v", err)
+	}
+}
+
+func TestUserIssuerAudienceConfigSymmetry(t *testing.T) {
+	keys := rsaKeys(t, "user-01")
+	customSigner, err := NewUserTokenSigner(keys, "user-01",
+		WithUserTokenIssuer("custom.example"),
+		WithUserTokenAudience("custom-api"),
+	)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	tok, err := customSigner.GenerateAccessToken("u@icaa.world", "", nil)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	// A cache expecting the same values verifies.
+	server := newJWKSServer()
+	server.addKey("user-01", keys["user-01"])
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+	matching := NewKeyCache(ts.URL,
+		WithExpectedUserIssuer("custom.example"),
+		WithExpectedUserAudience("custom-api"),
+	)
+	if _, err := matching.ValidateUserAccessToken(context.Background(), tok); err != nil {
+		t.Fatalf("matching iss/aud must verify: %v", err)
+	}
+
+	// A default cache rejects the custom token.
+	deflt := NewKeyCache(ts.URL)
+	if _, err := deflt.ValidateUserAccessToken(context.Background(), tok); err == nil {
+		t.Fatal("default cache must reject custom iss/aud token")
 	}
 }

@@ -14,8 +14,8 @@ import (
 const userLeeway = 30 * time.Second
 
 // buildUserParser returns an RS256-only parser for user tokens with the
-// given expected issuer and audience. It pins the signing method and
-// requires exp and iat.
+// given expected issuer and audience. It pins the signing method, requires
+// exp, and verifies iat when present.
 func buildUserParser(issuer, audience string) *jwt.Parser {
 	return jwt.NewParser(
 		jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
@@ -86,6 +86,9 @@ func (c *KeyCache) ValidateUserRefreshToken(ctx context.Context, tokenString str
 
 	if claims.TokenType != TokenTypeRefresh {
 		return "", fmt.Errorf("expected refresh token, got %s", claims.TokenType)
+	}
+	if err := claims.Validate(); err != nil {
+		return "", err
 	}
 	if claims.Subject == "" {
 		return "", fmt.Errorf("refresh token missing sub (token ID)")

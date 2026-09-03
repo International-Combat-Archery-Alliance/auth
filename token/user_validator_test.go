@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
+	"errors"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -302,5 +303,158 @@ func TestUserIssuerAudienceConfigSymmetry(t *testing.T) {
 	deflt := NewKeyCache(ts.URL)
 	if _, err := deflt.ValidateUserAccessToken(context.Background(), tok); err == nil {
 		t.Fatal("default cache must reject custom iss/aud token")
+	}
+}
+
+// signUserClaims mints an RS256 user token from explicit claims, for
+// rejection tests that the signer helpers cannot produce.
+func signUserClaims(t *testing.T, priv *rsa.PrivateKey, kid string, claims ICAAClaims) string {
+	t.Helper()
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tok.Header["kid"] = kid
+	signed, err := tok.SignedString(priv)
+	if err != nil {
+		t.Fatalf("sign user token: %v", err)
+	}
+	return signed
+}
+
+func validUserAccessClaims() ICAAClaims {
+	now := time.Now()
+	return ICAAClaims{
+		Email:     "u@icaa.world",
+		Roles:     []auth.Role{auth.RoleAdmin},
+		TokenType: TokenTypeAccess,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			Issuer:    DefaultIssuer,
+			Audience:  jwt.ClaimStrings{DefaultAudience},
+		},
+	}
+}
+
+func TestValidateUserAccessTokenExpiry(t *testing.T) {
+	keys := rsaKeys(t, "user-01")
+	cache := setupVerifiedCache(t, keys)
+	ctx := context.Background()
+
+	t.Run("expired beyond leeway rejected", func(t *testing.T) {
+		claims := validUserAccessClaims()
+		claims.RegisteredClaims.ExpiresAt = jwt.NewNumericDate(time.Now().Add(-5 * time.Minute))
+		tok := signUserClaims(t, keys["user-01"], "user-01", claims)
+		if _, err := cache.ValidateUserAccessToken(ctx, tok); err == nil {
+			t.Fatal("expected expired token to be rejected")
+		}
+	})
+
+	t.Run("missing exp rejected", func(t *testing.T) {
+		claims := validUserAccessClaims()
+		claims.RegisteredClaims.ExpiresAt = nil
+		tok := signUserClaims(t, keys["user-01"], "user-01", claims)
+		if _, err := cache.ValidateUserAccessToken(ctx, tok); err == nil {
+			t.Fatal("expected token without exp to be rejected")
+		}
+	})
+
+	t.Run("future iat rejected", func(t *testing.T) {
+		claims := validUserAccessClaims()
+		claims.IssuedAt = jwt.NewNumericDate(time.Now().Add(time.Hour))
+		tok := signUserClaims(t, keys["user-01"], "user-01", claims)
+		if _, err := cache.ValidateUserAccessToken(ctx, tok); err == nil {
+			t.Fatal("expected token with future iat to be rejected")
+		}
+	})
+
+	t.Run("missing iat accepted", func(t *testing.T) {
+		claims := validUserAccessClaims()
+		claims.IssuedAt = nil
+		tok := signUserClaims(t, keys["user-01"], "user-01", claims)
+		if _, err := cache.ValidateUserAccessToken(ctx, tok); err != nil {
+			t.Fatalf("missing iat is verified-only-when-present: %v", err)
+		}
+	})
+}
+
+func TestValidateUserAccessTokenKidEdgeCases(t *testing.T) {
+	keys := rsaKeys(t, "user-01")
+	cache := setupVerifiedCache(t, keys)
+	ctx := context.Background()
+
+	for _, kid := range []string{"", "USER-01", "user-", "machine-01"} {
+		t.Run("kid "+kid, func(t *testing.T) {
+			tok := signUserClaims(t, keys["user-01"], kid, validUserAccessClaims())
+			if kid == "" {
+				// Empty kid is dropped from the header entirely by the
+				// signing library; still must fail.
+			}
+			if _, err := cache.ValidateUserAccessToken(ctx, tok); err == nil {
+				t.Fatalf("expected kid %q to be rejected", kid)
+			}
+		})
+	}
+}
+
+func TestValidateUserAccessTokenUnknownKidIsErrUnknownKey(t *testing.T) {
+	keys := rsaKeys(t, "user-01")
+	other := rsaKeys(t, "user-02")
+	cache := setupVerifiedCache(t, keys)
+
+	tok := signUserClaims(t, other["user-02"], "user-02", validUserAccessClaims())
+	_, err := cache.ValidateUserAccessToken(context.Background(), tok)
+	if err == nil {
+		t.Fatal("expected unknown kid to fail verification")
+	}
+	if !errors.Is(err, ErrUnknownKey) {
+		t.Fatalf("expected ErrUnknownKey reachable via errors.Is, got %v", err)
+	}
+}
+
+func TestValidateUserRefreshTokenLegacyHS256Rejected(t *testing.T) {
+	keys := rsaKeys(t, "user-01")
+	cache := setupVerifiedCache(t, keys)
+
+	legacy := jwt.NewWithClaims(jwt.SigningMethodHS256, ICAAClaims{
+		TokenType: TokenTypeRefresh,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "token-id",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(30 * 24 * time.Hour)),
+			Issuer:    DefaultIssuer,
+			Audience:  jwt.ClaimStrings{DefaultAudience},
+		},
+	})
+	legacy.Header["kid"] = "user-01"
+	signed, err := legacy.SignedString([]byte("legacy-symmetric-secret-32-bytes!!!"))
+	if err != nil {
+		t.Fatalf("sign legacy: %v", err)
+	}
+	if _, err := cache.ValidateUserRefreshToken(context.Background(), signed); err == nil {
+		t.Fatal("expected legacy HS256 refresh token to be rejected")
+	}
+}
+
+func TestValidateUserRefreshWithDevKeys(t *testing.T) {
+	keys := rsaKeys(t, "user-dev")
+	signer, err := NewUserTokenSigner(keys, "user-dev")
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	id, refresh, _, err := signer.GenerateRefreshToken()
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	devPubs := map[string]*rsa.PublicKey{"user-dev": &keys["user-dev"].PublicKey}
+	local := NewKeyCache("",
+		WithLocalMode(),
+		WithDevKeys(devPubs),
+	)
+	got, err := local.ValidateUserRefreshToken(context.Background(), refresh)
+	if err != nil {
+		t.Fatalf("dev refresh token should verify with local opt-in: %v", err)
+	}
+	if got != id {
+		t.Fatalf("expected ID %q, got %q", id, got)
 	}
 }

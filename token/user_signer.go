@@ -85,8 +85,15 @@ func NewUserTokenSigner(keys map[string]*rsa.PrivateKey, currentKeyID string, op
 		}
 	}
 
+	// Copy the map so later mutations of the input by the caller cannot
+	// add, remove, or replace keys behind the signer.
+	owned := make(map[string]*rsa.PrivateKey, len(keys))
+	for kid, key := range keys {
+		owned[kid] = key
+	}
+
 	s := &UserTokenSigner{
-		keys:                 keys,
+		keys:                 owned,
 		currentKeyID:         currentKeyID,
 		issuer:               DefaultIssuer,
 		audience:             DefaultAudience,
@@ -207,6 +214,9 @@ func (s *UserTokenSigner) ValidateUserRefreshToken(_ context.Context, tokenStrin
 	}
 	if claims.TokenType != TokenTypeRefresh {
 		return "", fmt.Errorf("expected refresh token, got %s", claims.TokenType)
+	}
+	if err := claims.Validate(); err != nil {
+		return "", err
 	}
 	if claims.Subject == "" {
 		return "", fmt.Errorf("refresh token missing sub (token ID)")

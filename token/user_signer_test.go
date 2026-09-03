@@ -3,11 +3,13 @@ package token
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/International-Combat-Archery-Alliance/auth"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 func TestNewUserTokenSignerValidation(t *testing.T) {
@@ -116,5 +118,79 @@ func TestUserTokenSignerLocalValidation(t *testing.T) {
 	}
 	if !errors.Is(err, ErrUnknownKey) {
 		t.Fatalf("expected ErrUnknownKey, got %v", err)
+	}
+}
+
+func TestUserTokenSignerLocalAlgConfusion(t *testing.T) {
+	keys := rsaKeys(t, "user-01")
+	signer, err := NewUserTokenSigner(keys, "user-01")
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	ctx := t.Context()
+
+	t.Run("HS256 rejected", func(t *testing.T) {
+		der, err := x509.MarshalPKIXPublicKey(&keys["user-01"].PublicKey)
+		if err != nil {
+			t.Fatalf("marshal public key: %v", err)
+		}
+		claims := ICAAClaims{
+			Email:     "u@icaa.world",
+			TokenType: TokenTypeAccess,
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+				Issuer:    DefaultIssuer,
+				Audience:  jwt.ClaimStrings{DefaultAudience},
+			},
+		}
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		tok.Header["kid"] = "user-01"
+		signed, err := tok.SignedString(der)
+		if err != nil {
+			t.Fatalf("sign hs256: %v", err)
+		}
+		if _, err := signer.ValidateUserAccessToken(ctx, signed); err == nil {
+			t.Fatal("expected HS256 token to be rejected by signer-local validation")
+		}
+	})
+
+	t.Run("alg none rejected", func(t *testing.T) {
+		tok := jwt.NewWithClaims(jwt.SigningMethodNone, ICAAClaims{
+			Email:     "u@icaa.world",
+			TokenType: TokenTypeAccess,
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+				Issuer:    DefaultIssuer,
+				Audience:  jwt.ClaimStrings{DefaultAudience},
+			},
+		})
+		tok.Header["kid"] = "user-01"
+		signed, err := tok.SignedString(jwt.UnsafeAllowNoneSignatureType)
+		if err != nil {
+			t.Fatalf("sign none: %v", err)
+		}
+		if _, err := signer.ValidateUserAccessToken(ctx, signed); err == nil {
+			t.Fatal("expected alg=none token to be rejected by signer-local validation")
+		}
+	})
+}
+
+func TestUserTokenSignerMapCopied(t *testing.T) {
+	keys := rsaKeys(t, "user-01")
+	signer, err := NewUserTokenSigner(keys, "user-01")
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+
+	// Mutating the input map after construction must not affect the signer.
+	evil, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	keys["user-evil"] = evil
+	delete(keys, "user-01")
+
+	if _, err := signer.GenerateAccessToken("u@icaa.world", "", nil); err != nil {
+		t.Fatalf("signer must be unaffected by input map mutation: %v", err)
 	}
 }
